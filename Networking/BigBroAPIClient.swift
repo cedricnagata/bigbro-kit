@@ -43,6 +43,37 @@ struct BigBroAPIClient {
         let response = try JSONDecoder().decode(ChatResponse.self, from: data)
         return response.content
     }
+
+    func chatStream(token: String, messages: [Message]) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                do {
+                    var request = URLRequest(url: baseURL.appending(path: "/chat"))
+                    request.httpMethod = "POST"
+                    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    let body = ChatRequest(
+                        token: token,
+                        messages: messages.map { ChatRequest.Msg(role: $0.role.rawValue, content: $0.content) }
+                    )
+                    request.httpBody = try JSONEncoder().encode(body)
+                    let (bytes, _) = try await URLSession.shared.bytes(for: request)
+                    for try await line in bytes.lines {
+                        guard line.hasPrefix("data: ") else { continue }
+                        let payload = String(line.dropFirst(6))
+                        if payload == "[DONE]" { break }
+                        if let data = payload.data(using: .utf8),
+                           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                           let delta = json["delta"] as? String {
+                            continuation.yield(delta)
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
+    }
 }
 
 struct PairStatusResponse: Decodable {

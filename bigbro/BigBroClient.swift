@@ -68,6 +68,16 @@ public final class BigBroClient {
         return try await api.chat(token: token, messages: messages)
     }
 
+    public func chatStream(_ messages: [Message]) -> AsyncThrowingStream<String, Error> {
+        guard let device = currentDevice else {
+            return AsyncThrowingStream { $0.finish(throwing: BigBroError.notPaired) }
+        }
+        guard let token = KeychainTokenStore.shared.token(for: device.id) else {
+            return AsyncThrowingStream { $0.finish(throwing: BigBroError.notPaired) }
+        }
+        return BigBroAPIClient(device: device).chatStream(token: token, messages: messages)
+    }
+
     // MARK: - Private helpers
 
     private func deviceId() -> String {
