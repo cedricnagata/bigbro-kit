@@ -2,7 +2,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "BigBroKit",
+    name: "bigbro-kit",
     platforms: [.iOS(.v17)],
     products: [
         .library(name: "BigBroKit", targets: ["BigBroKit"])
