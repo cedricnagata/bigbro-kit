@@ -1,9 +1,8 @@
+// BigBroKit — iOS framework for connecting to BigBro Mac hosts.
 //
-//  bigbro.swift
-//  bigbro
+// Public API entry point: BigBroClient
 //
-//  Created by Cedric Nagata on 4/20/26.
-//
-
-import Foundation
-
+//   let client = BigBroClient()
+//   let devices = await client.discover()
+//   try await client.pair(with: devices[0])
+//   let reply = try await client.chat([.user("Hello")])
