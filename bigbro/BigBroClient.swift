@@ -20,6 +20,9 @@ public enum BigBroError: Error, LocalizedError {
 public final class BigBroClient: ObservableObject {
     @Published public private(set) var connectedDevice: BigBroDevice?
     @Published public private(set) var isConnected: Bool = false
+    /// Devices the user has successfully paired with in the past, most
+    /// recently-paired first. Persisted across launches.
+    @Published public private(set) var knownDevices: [BigBroDevice] = []
 
     private let browser = BonjourBrowser()
     private var presenceTask: Task<Void, Never>?
@@ -27,10 +30,13 @@ public final class BigBroClient: ObservableObject {
         didSet { connectedDevice = currentDevice }
     }
 
+    private static let knownDevicesKey = "bigbro.knownDevices"
+
     public init() {
         currentDevice = loadStoredDevice()
         connectedDevice = currentDevice
         isConnected = false
+        knownDevices = loadKnownDevices()
         if currentDevice != nil, tokenExists() {
             startPresence()
         }
@@ -62,6 +68,7 @@ public final class BigBroClient: ObservableObject {
                 KeychainTokenStore.shared.save(token: token, for: device.id)
                 await MainActor.run {
                     self.connectedDevice = device
+                    self.rememberDevice(device)
                 }
                 startPresence()
                 return true
@@ -192,6 +199,23 @@ public final class BigBroClient: ObservableObject {
         defaults.removeObject(forKey: "bigbro.device.name")
         defaults.removeObject(forKey: "bigbro.device.host")
         defaults.removeObject(forKey: "bigbro.device.port")
+    }
+
+    private func rememberDevice(_ device: BigBroDevice) {
+        var list = knownDevices.filter { $0.id != device.id }
+        list.insert(device, at: 0)
+        knownDevices = list
+        if let data = try? JSONEncoder().encode(list) {
+            UserDefaults.standard.set(data, forKey: Self.knownDevicesKey)
+        }
+    }
+
+    private func loadKnownDevices() -> [BigBroDevice] {
+        guard let data = UserDefaults.standard.data(forKey: Self.knownDevicesKey),
+              let list = try? JSONDecoder().decode([BigBroDevice].self, from: data) else {
+            return []
+        }
+        return list
     }
 
     private func loadStoredDevice() -> BigBroDevice? {

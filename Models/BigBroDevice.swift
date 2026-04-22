@@ -1,6 +1,6 @@
 import Foundation
 
-public struct BigBroDevice: Identifiable, Sendable, Hashable {
+public struct BigBroDevice: Identifiable, Sendable, Hashable, Codable {
     public let id: String
     public let name: String
     public let host: String
