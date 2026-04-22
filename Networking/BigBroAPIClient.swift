@@ -44,6 +44,27 @@ struct BigBroAPIClient {
         return response.content
     }
 
+    /// Opens a long-lived SSE stream to the Mac used purely for presence.
+    /// Returns when the server closes the stream or the connection drops.
+    /// `onOpen` fires once the HTTP 200 response is received (stream established).
+    func streamPresence(token: String, onOpen: @Sendable () -> Void) async throws {
+        var components = URLComponents(url: baseURL.appending(path: "/presence"), resolvingAgainstBaseURL: false)!
+        components.queryItems = [URLQueryItem(name: "token", value: token)]
+        guard let url = components.url else { throw BigBroError.networkError }
+        var request = URLRequest(url: url, timeoutInterval: 0)
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+        guard status == 200 else {
+            print("[BigBroKit] /presence -> \(status)")
+            throw BigBroError.networkError
+        }
+        onOpen()
+        for try await _ in bytes.lines {
+            // consume keepalives; stream ends when server closes or connection drops
+        }
+    }
+
     func chatStream(token: String, messages: [Message]) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
             Task {

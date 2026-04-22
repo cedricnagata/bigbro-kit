@@ -22,17 +22,18 @@ public final class BigBroClient: ObservableObject {
     @Published public private(set) var isConnected: Bool = false
 
     private let browser = BonjourBrowser()
+    private var presenceTask: Task<Void, Never>?
     private var currentDevice: BigBroDevice? {
-        didSet {
-            connectedDevice = currentDevice
-            isConnected = currentDevice != nil && tokenExists()
-        }
+        didSet { connectedDevice = currentDevice }
     }
 
     public init() {
         currentDevice = loadStoredDevice()
-        isConnected = currentDevice != nil && tokenExists()
         connectedDevice = currentDevice
+        isConnected = false
+        if currentDevice != nil, tokenExists() {
+            startPresence()
+        }
     }
 
     // MARK: - Public API
@@ -61,8 +62,8 @@ public final class BigBroClient: ObservableObject {
                 KeychainTokenStore.shared.save(token: token, for: device.id)
                 await MainActor.run {
                     self.connectedDevice = device
-                    self.isConnected = true
                 }
+                startPresence()
                 return true
             case "denied":
                 self.currentDevice = nil
@@ -106,11 +107,40 @@ public final class BigBroClient: ObservableObject {
 
     public func disconnect() {
         guard let device = currentDevice else { return }
+        presenceTask?.cancel()
+        presenceTask = nil
         KeychainTokenStore.shared.delete(for: device.id)
         clearStoredDevice()
         currentDevice = nil
         connectedDevice = nil
         isConnected = false
+    }
+
+    // MARK: - Presence
+
+    private func startPresence() {
+        presenceTask?.cancel()
+        presenceTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                guard let device = self.currentDevice,
+                      let token = KeychainTokenStore.shared.token(for: device.id) else {
+                    await MainActor.run { self.isConnected = false }
+                    return
+                }
+                let api = BigBroAPIClient(device: device)
+                do {
+                    try await api.streamPresence(token: token) {
+                        Task { @MainActor [weak self] in self?.isConnected = true }
+                    }
+                } catch {
+                    print("[BigBroKit] presence stream error: \(error)")
+                }
+                await MainActor.run { [weak self] in self?.isConnected = false }
+                if Task.isCancelled { break }
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+            }
+        }
     }
 
     // MARK: - Deprecated aliases
