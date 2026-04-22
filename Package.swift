@@ -18,7 +18,8 @@ let package = Package(
                 "Discovery/BonjourBrowser.swift",
                 "Networking/BigBroAPIClient.swift",
                 "Storage/KeychainTokenStore.swift",
-                "UI/BigBroChatView.swift"
+                "UI/BigBroChatView.swift",
+                "UI/BigBroConnectionView.swift"
             ]
         )
     ]

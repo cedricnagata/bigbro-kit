@@ -17,12 +17,22 @@ public enum BigBroError: Error, LocalizedError {
     }
 }
 
-public final class BigBroClient {
+public final class BigBroClient: ObservableObject {
+    @Published public private(set) var connectedDevice: BigBroDevice?
+    @Published public private(set) var isConnected: Bool = false
+
     private let browser = BonjourBrowser()
-    private var currentDevice: BigBroDevice?
+    private var currentDevice: BigBroDevice? {
+        didSet {
+            connectedDevice = currentDevice
+            isConnected = currentDevice != nil && tokenExists()
+        }
+    }
 
     public init() {
         currentDevice = loadStoredDevice()
+        isConnected = currentDevice != nil && tokenExists()
+        connectedDevice = currentDevice
     }
 
     // MARK: - Public API
@@ -49,8 +59,14 @@ public final class BigBroClient {
             case "approved":
                 guard let token = status.token else { throw BigBroError.missingToken }
                 KeychainTokenStore.shared.save(token: token, for: device.id)
+                await MainActor.run {
+                    self.connectedDevice = device
+                    self.isConnected = true
+                }
                 return true
             case "denied":
+                self.currentDevice = nil
+                clearStoredDevice()
                 return false
             default:
                 continue
@@ -59,26 +75,66 @@ public final class BigBroClient {
         throw BigBroError.timeout
     }
 
-    public func chat(_ messages: [Message]) async throws -> String {
-        guard let device = currentDevice else { throw BigBroError.notPaired }
-        guard let token = KeychainTokenStore.shared.token(for: device.id) else {
-            throw BigBroError.notPaired
-        }
-        let api = BigBroAPIClient(device: device)
-        return try await api.chat(token: token, messages: messages)
-    }
-
-    public func chatStream(_ messages: [Message]) -> AsyncThrowingStream<String, Error> {
+    /// Send messages and receive the response.
+    /// - Parameters:
+    ///   - messages: The conversation history to send.
+    ///   - streaming: `true` (default) streams tokens as they arrive; `false` yields the full response as one chunk.
+    public func send(_ messages: [Message], streaming: Bool = true) -> AsyncThrowingStream<String, Error> {
         guard let device = currentDevice else {
             return AsyncThrowingStream { $0.finish(throwing: BigBroError.notPaired) }
         }
         guard let token = KeychainTokenStore.shared.token(for: device.id) else {
             return AsyncThrowingStream { $0.finish(throwing: BigBroError.notPaired) }
         }
-        return BigBroAPIClient(device: device).chatStream(token: token, messages: messages)
+        let api = BigBroAPIClient(device: device)
+        if streaming {
+            return api.chatStream(token: token, messages: messages)
+        } else {
+            return AsyncThrowingStream { continuation in
+                Task {
+                    do {
+                        let reply = try await api.chat(token: token, messages: messages)
+                        continuation.yield(reply)
+                        continuation.finish()
+                    } catch {
+                        continuation.finish(throwing: error)
+                    }
+                }
+            }
+        }
+    }
+
+    public func disconnect() {
+        guard let device = currentDevice else { return }
+        KeychainTokenStore.shared.delete(for: device.id)
+        clearStoredDevice()
+        currentDevice = nil
+        connectedDevice = nil
+        isConnected = false
+    }
+
+    // MARK: - Deprecated aliases
+
+    @available(*, deprecated, renamed: "send(_:streaming:)")
+    public func chatStream(_ messages: [Message]) -> AsyncThrowingStream<String, Error> {
+        send(messages, streaming: true)
+    }
+
+    @available(*, deprecated, renamed: "send(_:streaming:)")
+    public func chat(_ messages: [Message]) async throws -> String {
+        guard let device = currentDevice else { throw BigBroError.notPaired }
+        guard let token = KeychainTokenStore.shared.token(for: device.id) else {
+            throw BigBroError.notPaired
+        }
+        return try await BigBroAPIClient(device: device).chat(token: token, messages: messages)
     }
 
     // MARK: - Private helpers
+
+    private func tokenExists() -> Bool {
+        guard let device = currentDevice else { return false }
+        return KeychainTokenStore.shared.token(for: device.id) != nil
+    }
 
     private func deviceId() -> String {
         UIDevice.current.identifierForVendor?.uuidString ?? UUID().uuidString
@@ -90,6 +146,14 @@ public final class BigBroClient {
         defaults.set(device.name, forKey: "bigbro.device.name")
         defaults.set(device.host, forKey: "bigbro.device.host")
         defaults.set(device.port, forKey: "bigbro.device.port")
+    }
+
+    private func clearStoredDevice() {
+        let defaults = UserDefaults.standard
+        defaults.removeObject(forKey: "bigbro.device.id")
+        defaults.removeObject(forKey: "bigbro.device.name")
+        defaults.removeObject(forKey: "bigbro.device.host")
+        defaults.removeObject(forKey: "bigbro.device.port")
     }
 
     private func loadStoredDevice() -> BigBroDevice? {
