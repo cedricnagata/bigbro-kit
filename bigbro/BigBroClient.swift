@@ -17,30 +17,19 @@ public enum BigBroError: Error, LocalizedError {
     }
 }
 
+/// Session-scoped client for BigBro. No persistence across launches — every
+/// launch starts disconnected; the user taps Find BigBro to pair. The Mac
+/// remembers devices and auto-approves known ones, so "re-pair" is silent.
 public final class BigBroClient: ObservableObject {
     @Published public private(set) var connectedDevice: BigBroDevice?
     @Published public private(set) var isConnected: Bool = false
-    /// Devices the user has successfully paired with in the past, most
-    /// recently-paired first. Persisted across launches.
-    @Published public private(set) var knownDevices: [BigBroDevice] = []
 
     private let browser = BonjourBrowser()
     private var presenceTask: Task<Void, Never>?
-    private var currentDevice: BigBroDevice? {
-        didSet { connectedDevice = currentDevice }
-    }
+    private var currentDevice: BigBroDevice?
+    private var currentToken: String?
 
-    private static let knownDevicesKey = "bigbro.knownDevices"
-
-    public init() {
-        currentDevice = loadStoredDevice()
-        connectedDevice = currentDevice
-        isConnected = false
-        knownDevices = loadKnownDevices()
-        if currentDevice != nil, tokenExists() {
-            startPresence()
-        }
-    }
+    public init() {}
 
     // MARK: - Public API
 
@@ -49,9 +38,6 @@ public final class BigBroClient: ObservableObject {
     }
 
     public func pair(with device: BigBroDevice) async throws -> Bool {
-        self.currentDevice = device
-        saveStoredDevice(device)
-
         let myId = deviceId()
         let myName = await UIDevice.current.name
         let api = BigBroAPIClient(device: device)
@@ -65,16 +51,14 @@ public final class BigBroClient: ObservableObject {
             switch status.status {
             case "approved":
                 guard let token = status.token else { throw BigBroError.missingToken }
-                KeychainTokenStore.shared.save(token: token, for: device.id)
                 await MainActor.run {
+                    self.currentDevice = device
+                    self.currentToken = token
                     self.connectedDevice = device
-                    self.rememberDevice(device)
                 }
                 startPresence()
                 return true
             case "denied":
-                self.currentDevice = nil
-                clearStoredDevice()
                 return false
             default:
                 continue
@@ -83,15 +67,8 @@ public final class BigBroClient: ObservableObject {
         throw BigBroError.timeout
     }
 
-    /// Send messages and receive the response.
-    /// - Parameters:
-    ///   - messages: The conversation history to send.
-    ///   - streaming: `true` (default) streams tokens as they arrive; `false` yields the full response as one chunk.
     public func send(_ messages: [Message], streaming: Bool = true) -> AsyncThrowingStream<String, Error> {
-        guard let device = currentDevice else {
-            return AsyncThrowingStream { $0.finish(throwing: BigBroError.notPaired) }
-        }
-        guard let token = KeychainTokenStore.shared.token(for: device.id) else {
+        guard let device = currentDevice, let token = currentToken else {
             return AsyncThrowingStream { $0.finish(throwing: BigBroError.notPaired) }
         }
         let api = BigBroAPIClient(device: device)
@@ -112,37 +89,24 @@ public final class BigBroClient: ObservableObject {
         }
     }
 
-    /// Drop the presence stream and start a new one. Useful when the UI thinks
-    /// we're disconnected (server died, network blip) and we want to re-check
-    /// without waiting for the 15s read-timeout to fire.
-    public func refresh() {
-        guard currentDevice != nil, tokenExists() else { return }
-        presenceTask?.cancel()
-        startPresence()
-    }
-
+    /// Fully disconnect: cancel the presence stream and forget the device and
+    /// token. The user must Find BigBro again to reconnect.
     public func disconnect() {
-        guard let device = currentDevice else { return }
         presenceTask?.cancel()
         presenceTask = nil
-        KeychainTokenStore.shared.delete(for: device.id)
-        clearStoredDevice()
-        currentDevice = nil
-        connectedDevice = nil
-        isConnected = false
+        teardown()
     }
 
     // MARK: - Presence
 
-    /// Open one presence stream. When it ends (server closed, network drop,
-    /// read-timeout fired), mark disconnected and stop — no auto-retry.
-    /// Callers use `refresh()` to reconnect.
+    /// Open one presence stream. When it ends for any reason (Mac-initiated
+    /// disconnect, remove, network drop, 15s heartbeat timeout), tear down
+    /// fully — iOS forgets the device and token.
     private func startPresence() {
         presenceTask?.cancel()
         presenceTask = Task { [weak self] in
             guard let self else { return }
-            guard let device = self.currentDevice,
-                  let token = KeychainTokenStore.shared.token(for: device.id) else {
+            guard let device = self.currentDevice, let token = self.currentToken else {
                 await MainActor.run { self.isConnected = false }
                 return
             }
@@ -154,8 +118,15 @@ public final class BigBroClient: ObservableObject {
             } catch {
                 print("[BigBroKit] presence stream error: \(error)")
             }
-            await MainActor.run { [weak self] in self?.isConnected = false }
+            await MainActor.run { [weak self] in self?.teardown() }
         }
+    }
+
+    private func teardown() {
+        isConnected = false
+        currentDevice = nil
+        currentToken = nil
+        connectedDevice = nil
     }
 
     // MARK: - Deprecated aliases
@@ -167,64 +138,13 @@ public final class BigBroClient: ObservableObject {
 
     @available(*, deprecated, renamed: "send(_:streaming:)")
     public func chat(_ messages: [Message]) async throws -> String {
-        guard let device = currentDevice else { throw BigBroError.notPaired }
-        guard let token = KeychainTokenStore.shared.token(for: device.id) else {
-            throw BigBroError.notPaired
-        }
+        guard let device = currentDevice, let token = currentToken else { throw BigBroError.notPaired }
         return try await BigBroAPIClient(device: device).chat(token: token, messages: messages)
     }
 
     // MARK: - Private helpers
 
-    private func tokenExists() -> Bool {
-        guard let device = currentDevice else { return false }
-        return KeychainTokenStore.shared.token(for: device.id) != nil
-    }
-
     private func deviceId() -> String {
         UIDevice.current.identifierForVendor?.uuidString ?? UUID().uuidString
-    }
-
-    private func saveStoredDevice(_ device: BigBroDevice) {
-        let defaults = UserDefaults.standard
-        defaults.set(device.id, forKey: "bigbro.device.id")
-        defaults.set(device.name, forKey: "bigbro.device.name")
-        defaults.set(device.host, forKey: "bigbro.device.host")
-        defaults.set(device.port, forKey: "bigbro.device.port")
-    }
-
-    private func clearStoredDevice() {
-        let defaults = UserDefaults.standard
-        defaults.removeObject(forKey: "bigbro.device.id")
-        defaults.removeObject(forKey: "bigbro.device.name")
-        defaults.removeObject(forKey: "bigbro.device.host")
-        defaults.removeObject(forKey: "bigbro.device.port")
-    }
-
-    private func rememberDevice(_ device: BigBroDevice) {
-        var list = knownDevices.filter { $0.id != device.id }
-        list.insert(device, at: 0)
-        knownDevices = list
-        if let data = try? JSONEncoder().encode(list) {
-            UserDefaults.standard.set(data, forKey: Self.knownDevicesKey)
-        }
-    }
-
-    private func loadKnownDevices() -> [BigBroDevice] {
-        guard let data = UserDefaults.standard.data(forKey: Self.knownDevicesKey),
-              let list = try? JSONDecoder().decode([BigBroDevice].self, from: data) else {
-            return []
-        }
-        return list
-    }
-
-    private func loadStoredDevice() -> BigBroDevice? {
-        let defaults = UserDefaults.standard
-        guard let id = defaults.string(forKey: "bigbro.device.id"),
-              let name = defaults.string(forKey: "bigbro.device.name"),
-              let host = defaults.string(forKey: "bigbro.device.host") else { return nil }
-        let port = defaults.integer(forKey: "bigbro.device.port")
-        guard port > 0 else { return nil }
-        return BigBroDevice(id: id, name: name, host: host, port: port)
     }
 }
