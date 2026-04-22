@@ -37,44 +37,86 @@ Add the following to your app's `Info.plist`:
 
 ## Usage
 
+`BigBroClient` is an `ObservableObject`, so you can observe its state directly from SwiftUI:
+
 ```swift
+import SwiftUI
 import BigBroKit
 
-let client = BigBroClient()
+struct ContentView: View {
+    @StateObject private var client = BigBroClient()
 
-// 1. Discover BigBro Macs on the local network
-let devices = await client.discover()
-
-// 2. Pair with a device (shows an approval dialog on the Mac)
-let approved = try await client.pair(with: devices[0])
-
-// 3. Stream a chat response token by token
-if approved {
-    let messages: [Message] = [.user("Explain Swift concurrency in one paragraph.")]
-    for try await delta in client.chatStream(messages) {
-        print(delta, terminator: "")
+    var body: some View {
+        VStack {
+            if client.isConnected {
+                Text("Connected to \(client.connectedDevice?.name ?? "")")
+            } else {
+                Button("Find BigBro") {
+                    Task {
+                        let devices = await client.discover()
+                        if let mac = devices.first {
+                            _ = try? await client.pair(with: mac)
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 ```
+
+Sending messages:
+
+```swift
+let messages: [Message] = [.user("Explain Swift concurrency in one paragraph.")]
+
+// Streaming (default) — deltas arrive one token at a time
+for try await delta in client.send(messages) {
+    print(delta, terminator: "")
+}
+
+// Non-streaming — full response arrives as a single chunk
+for try await reply in client.send(messages, streaming: false) {
+    print(reply)
+}
+```
+
+## Session model
+
+BigBroKit keeps **no persistent state** — no stored device, no stored token, no known-devices history. Every launch starts disconnected; the user has to Find BigBro again.
+
+The Mac, however, remembers every device it has approved. When an iOS device re-pairs after a fresh launch, the Mac auto-approves silently (no dialog, no user tap), so the re-connect flow feels instant.
+
+A presence stream (`/presence` SSE) keeps `isConnected` in sync. The stream ends — and the client fully tears down (device + token forgotten) — when any of these happens:
+
+- The Mac user clicks **Disconnect** or **Remove** on that device
+- The iOS device doesn't receive a heartbeat for 15 seconds
+- The network drops
 
 ## API
 
 ### `BigBroClient`
 
 ```swift
-public final class BigBroClient {
-    // Discovers BigBro Macs on the local network (5s timeout)
+public final class BigBroClient: ObservableObject {
+    @Published public private(set) var connectedDevice: BigBroDevice?
+    @Published public private(set) var isConnected: Bool
+
+    // Discover BigBro Macs on the local network (5s Bonjour timeout)
     public func discover() async -> [BigBroDevice]
 
-    // Sends a pairing request and polls for approval (60s timeout)
-    // Returns true if approved, false if denied
+    // Send a pair request and poll for approval (60s timeout).
+    // Returns true if approved, false if denied.
+    // On approval, opens the presence stream and sets isConnected=true.
     public func pair(with device: BigBroDevice) async throws -> Bool
 
-    // Streams a chat response as individual token deltas
-    public func chatStream(_ messages: [Message]) -> AsyncThrowingStream<String, Error>
+    // Send messages. `streaming: true` yields token deltas as they arrive;
+    // `streaming: false` yields the full response as a single element.
+    public func send(_ messages: [Message],
+                     streaming: Bool = true) -> AsyncThrowingStream<String, Error>
 
-    // Returns the full response as a single string
-    public func chat(_ messages: [Message]) async throws -> String
+    // Close the presence stream and forget device + token.
+    public func disconnect()
 }
 ```
 
@@ -91,7 +133,7 @@ public struct Message {
 ### `BigBroDevice`
 
 ```swift
-public struct BigBroDevice: Identifiable {
+public struct BigBroDevice: Identifiable, Hashable {
     public let id: String
     public let name: String   // e.g. "Cedric's MacBook Pro"
     public let host: String
@@ -99,12 +141,12 @@ public struct BigBroDevice: Identifiable {
 }
 ```
 
-## Error handling
+### Errors
 
 ```swift
 public enum BigBroError: LocalizedError {
-    case notPaired       // chat called before pairing
-    case timeout         // pairing request timed out after 60s
+    case notPaired       // send() called before pairing
+    case timeout         // pair() timed out waiting for approval
     case missingToken    // approved but no token returned
     case networkError    // network-level failure
 }
