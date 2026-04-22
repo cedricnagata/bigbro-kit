@@ -105,6 +105,15 @@ public final class BigBroClient: ObservableObject {
         }
     }
 
+    /// Drop the presence stream and start a new one. Useful when the UI thinks
+    /// we're disconnected (server died, network blip) and we want to re-check
+    /// without waiting for the 15s read-timeout to fire.
+    public func refresh() {
+        guard currentDevice != nil, tokenExists() else { return }
+        presenceTask?.cancel()
+        startPresence()
+    }
+
     public func disconnect() {
         guard let device = currentDevice else { return }
         presenceTask?.cancel()

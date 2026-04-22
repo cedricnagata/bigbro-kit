@@ -45,15 +45,27 @@ struct BigBroAPIClient {
     }
 
     /// Opens a long-lived SSE stream to the Mac used purely for presence.
-    /// Returns when the server closes the stream or the connection drops.
-    /// `onOpen` fires once the HTTP 200 response is received (stream established).
+    /// Returns when the server closes the stream, the connection drops, or
+    /// no data arrives for 15 seconds (read-side watchdog via URLSession's
+    /// `timeoutIntervalForRequest`). `onOpen` fires once the HTTP 200 response
+    /// is received (stream established).
     func streamPresence(token: String, onOpen: @Sendable () -> Void) async throws {
         var components = URLComponents(url: baseURL.appending(path: "/presence"), resolvingAgainstBaseURL: false)!
         components.queryItems = [URLQueryItem(name: "token", value: token)]
         guard let url = components.url else { throw BigBroError.networkError }
-        var request = URLRequest(url: url, timeoutInterval: 0)
+        var request = URLRequest(url: url)
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+
+        // timeoutIntervalForRequest is reset on each received byte; if 15s pass
+        // with no data from the Mac, URLSession aborts and we treat that as a
+        // dead connection.
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 15
+        config.timeoutIntervalForResource = .infinity
+        let session = URLSession(configuration: config)
+        defer { session.invalidateAndCancel() }
+
+        let (bytes, response) = try await session.bytes(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
         guard status == 200 else {
             print("[BigBroKit] /presence -> \(status)")
@@ -61,7 +73,8 @@ struct BigBroAPIClient {
         }
         onOpen()
         for try await _ in bytes.lines {
-            // consume keepalives; stream ends when server closes or connection drops
+            // consume keepalives; stream ends when server closes, connection
+            // drops, or the 15s read timeout fires.
         }
     }
 
