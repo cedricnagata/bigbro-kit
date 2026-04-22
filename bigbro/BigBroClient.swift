@@ -127,28 +127,27 @@ public final class BigBroClient: ObservableObject {
 
     // MARK: - Presence
 
+    /// Open one presence stream. When it ends (server closed, network drop,
+    /// read-timeout fired), mark disconnected and stop — no auto-retry.
+    /// Callers use `refresh()` to reconnect.
     private func startPresence() {
         presenceTask?.cancel()
         presenceTask = Task { [weak self] in
-            while !Task.isCancelled {
-                guard let self else { return }
-                guard let device = self.currentDevice,
-                      let token = KeychainTokenStore.shared.token(for: device.id) else {
-                    await MainActor.run { self.isConnected = false }
-                    return
-                }
-                let api = BigBroAPIClient(device: device)
-                do {
-                    try await api.streamPresence(token: token) {
-                        Task { @MainActor [weak self] in self?.isConnected = true }
-                    }
-                } catch {
-                    print("[BigBroKit] presence stream error: \(error)")
-                }
-                await MainActor.run { [weak self] in self?.isConnected = false }
-                if Task.isCancelled { break }
-                try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard let self else { return }
+            guard let device = self.currentDevice,
+                  let token = KeychainTokenStore.shared.token(for: device.id) else {
+                await MainActor.run { self.isConnected = false }
+                return
             }
+            let api = BigBroAPIClient(device: device)
+            do {
+                try await api.streamPresence(token: token) {
+                    Task { @MainActor [weak self] in self?.isConnected = true }
+                }
+            } catch {
+                print("[BigBroKit] presence stream error: \(error)")
+            }
+            await MainActor.run { [weak self] in self?.isConnected = false }
         }
     }
 
