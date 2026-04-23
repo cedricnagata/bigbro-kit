@@ -15,6 +15,7 @@ let package = Package(
                 "bigbro/BigBroClient.swift",
                 "Models/BigBroDevice.swift",
                 "Models/Message.swift",
+                "Models/Tool.swift",
                 "Discovery/BonjourBrowser.swift",
                 "Networking/BigBroAPIClient.swift",
                 "Storage/KeychainTokenStore.swift",

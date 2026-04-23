@@ -26,4 +26,8 @@ public struct Message: Sendable {
     public static func system(_ content: String) -> Message {
         Message(role: .system, content: content)
     }
+
+    func toDict() -> [String: Any] {
+        ["role": role.rawValue, "content": content]
+    }
 }

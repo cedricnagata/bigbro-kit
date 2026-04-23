@@ -1,5 +1,11 @@
 import Foundation
 
+// Internal event type used by the agentic loop in BigBroClient.
+enum ChatStreamEvent {
+    case delta(String)
+    case toolCalls([[String: Any]])
+}
+
 struct BigBroAPIClient {
     let device: BigBroDevice
 
@@ -30,26 +36,80 @@ struct BigBroAPIClient {
         return try JSONDecoder().decode(PairStatusResponse.self, from: data)
     }
 
-    func chat(token: String, messages: [Message]) async throws -> String {
+    func chat(token: String, messages: [[String: Any]]) async throws -> String {
         var request = URLRequest(url: baseURL.appending(path: "/chat"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let body = ChatRequest(
-            token: token,
-            messages: messages.map { ChatRequest.Msg(role: $0.role.rawValue, content: $0.content) },
-            stream: false
-        )
-        request.httpBody = try JSONEncoder().encode(body)
+        let body: [String: Any] = ["token": token, "messages": messages, "stream": false]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, _) = try await URLSession.shared.data(for: request)
         let response = try JSONDecoder().decode(ChatResponse.self, from: data)
         return response.content
     }
 
-    /// Opens a long-lived SSE stream to the Mac used purely for presence.
-    /// Returns when the server closes the stream, the connection drops, or
-    /// no data arrives for 15 seconds (read-side watchdog via URLSession's
-    /// `timeoutIntervalForRequest`). `onOpen` fires once the HTTP 200 response
-    /// is received (stream established).
+    /// SSE streaming chat without tools.
+    func chatStream(token: String, messages: [[String: Any]]) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                do {
+                    for try await event in chatEvents(token: token, messages: messages, tools: []) {
+                        if case .delta(let text) = event { continuation.yield(text) }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// SSE streaming that surfaces both text deltas and tool calls.
+    /// Used by BigBroClient's agentic loop when tools are provided.
+    func chatEvents(token: String,
+                    messages: [[String: Any]],
+                    tools: [BigBroTool]) -> AsyncThrowingStream<ChatStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                do {
+                    var request = URLRequest(url: baseURL.appending(path: "/chat"))
+                    request.httpMethod = "POST"
+                    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+                    var body: [String: Any] = ["token": token, "messages": messages, "stream": true]
+                    if !tools.isEmpty {
+                        let toolDefs = try tools.map { tool -> Any in
+                            let data = try JSONEncoder().encode(tool.definition)
+                            return try JSONSerialization.jsonObject(with: data)
+                        }
+                        body["tools"] = toolDefs
+                    }
+                    request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+                    let (bytes, _) = try await URLSession.shared.bytes(for: request)
+                    for try await line in bytes.lines {
+                        guard line.hasPrefix("data: ") else { continue }
+                        let payload = String(line.dropFirst(6))
+                        if payload == "[DONE]" { break }
+                        guard let data = payload.data(using: .utf8),
+                              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                        else { continue }
+
+                        if let delta = json["delta"] as? String {
+                            continuation.yield(.delta(delta))
+                        } else if let raw = json["tool_calls"],
+                                  let calls = raw as? [[String: Any]] {
+                            continuation.yield(.toolCalls(calls))
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// Long-lived SSE presence stream.
     func streamPresence(token: String, onOpen: @Sendable () -> Void) async throws {
         var components = URLComponents(url: baseURL.appending(path: "/presence"), resolvingAgainstBaseURL: false)!
         components.queryItems = [URLQueryItem(name: "token", value: token)]
@@ -57,9 +117,6 @@ struct BigBroAPIClient {
         var request = URLRequest(url: url)
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
 
-        // timeoutIntervalForRequest is reset on each received byte; if 15s pass
-        // with no data from the Mac, URLSession aborts and we treat that as a
-        // dead connection.
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 15
         config.timeoutIntervalForResource = .infinity
@@ -73,64 +130,13 @@ struct BigBroAPIClient {
             throw BigBroError.networkError
         }
         onOpen()
-        for try await _ in bytes.lines {
-            // consume keepalives; stream ends when server closes, connection
-            // drops, or the 15s read timeout fires.
-        }
-    }
-
-    func chatStream(token: String, messages: [Message]) -> AsyncThrowingStream<String, Error> {
-        AsyncThrowingStream { continuation in
-            Task {
-                do {
-                    var request = URLRequest(url: baseURL.appending(path: "/chat"))
-                    request.httpMethod = "POST"
-                    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                    let body = ChatRequest(
-                        token: token,
-                        messages: messages.map { ChatRequest.Msg(role: $0.role.rawValue, content: $0.content) },
-                        stream: true
-                    )
-                    request.httpBody = try JSONEncoder().encode(body)
-                    let (bytes, _) = try await URLSession.shared.bytes(for: request)
-                    for try await line in bytes.lines {
-                        guard line.hasPrefix("data: ") else { continue }
-                        let payload = String(line.dropFirst(6))
-                        if payload == "[DONE]" { break }
-                        if let data = payload.data(using: .utf8),
-                           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                           let delta = json["delta"] as? String {
-                            continuation.yield(delta)
-                        }
-                    }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-        }
+        for try await _ in bytes.lines { }
     }
 }
 
 struct PairStatusResponse: Decodable {
     let status: String
     let token: String?
-}
-
-private struct ChatRequest: Encodable {
-    let token: String
-    struct Msg: Encodable {
-        let role: String
-        let content: String
-    }
-    let messages: [Msg]
-    let stream: Bool?
-    
-    init(token: String, messages: [Msg], stream: Bool? = nil) {
-        self.token = token
-        self.messages = messages
-        self.stream = stream
-    }
 }
 
 private struct ChatResponse: Decodable {

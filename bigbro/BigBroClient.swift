@@ -67,23 +67,92 @@ public final class BigBroClient: ObservableObject {
         throw BigBroError.timeout
     }
 
-    public func send(_ messages: [Message], streaming: Bool = true) -> AsyncThrowingStream<String, Error> {
+    /// Send messages and stream the response.
+    /// When `tools` are provided the client runs the full agentic loop —
+    /// tool calls are executed locally and only the final text is yielded.
+    public func send(_ messages: [Message],
+                     streaming: Bool = true,
+                     tools: [BigBroTool] = []) -> AsyncThrowingStream<String, Error> {
         guard let device = currentDevice, let token = currentToken else {
             return AsyncThrowingStream { $0.finish(throwing: BigBroError.notPaired) }
         }
         let api = BigBroAPIClient(device: device)
-        if streaming {
-            return api.chatStream(token: token, messages: messages)
-        } else {
-            return AsyncThrowingStream { continuation in
-                Task {
-                    do {
-                        let reply = try await api.chat(token: token, messages: messages)
-                        continuation.yield(reply)
-                        continuation.finish()
-                    } catch {
-                        continuation.finish(throwing: error)
+
+        // Fast paths when no tools are involved.
+        if tools.isEmpty {
+            if streaming {
+                return api.chatStream(token: token, messages: messages.map { $0.toDict() })
+            } else {
+                return AsyncThrowingStream { continuation in
+                    Task {
+                        do {
+                            let reply = try await api.chat(token: token, messages: messages.map { $0.toDict() })
+                            continuation.yield(reply)
+                            continuation.finish()
+                        } catch {
+                            continuation.finish(throwing: error)
+                        }
                     }
+                }
+            }
+        }
+
+        // Agentic loop: keep calling the model until it stops requesting tools.
+        return AsyncThrowingStream { continuation in
+            Task {
+                var workingMessages: [[String: Any]] = messages.map { $0.toDict() }
+                do {
+                    while true {
+                        var accumulated = ""
+                        var pendingToolCalls: [[String: Any]]? = nil
+
+                        for try await event in api.chatEvents(token: token,
+                                                              messages: workingMessages,
+                                                              tools: tools) {
+                            switch event {
+                            case .delta(let text):
+                                if streaming {
+                                    continuation.yield(text)
+                                } else {
+                                    accumulated += text
+                                }
+                            case .toolCalls(let calls):
+                                pendingToolCalls = calls
+                            }
+                        }
+
+                        guard let calls = pendingToolCalls else {
+                            // Model gave a text response — we're done.
+                            if !streaming { continuation.yield(accumulated) }
+                            break
+                        }
+
+                        // Append the assistant's tool-call turn to context.
+                        workingMessages.append([
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": calls
+                        ])
+
+                        // Execute each requested tool and append results.
+                        for call in calls {
+                            guard let fn = call["function"] as? [String: Any],
+                                  let name = fn["name"] as? String else { continue }
+                            let args = (fn["arguments"] as? [String: Any]) ?? [:]
+                            if let tool = tools.first(where: { $0.definition.function.name == name }) {
+                                let result = await tool.handler(args)
+                                workingMessages.append([
+                                    "role": "tool",
+                                    "content": result,
+                                    "tool_name": name
+                                ])
+                            }
+                        }
+                        // Loop: send tool results back to the model.
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
                 }
             }
         }
@@ -127,19 +196,6 @@ public final class BigBroClient: ObservableObject {
         currentDevice = nil
         currentToken = nil
         connectedDevice = nil
-    }
-
-    // MARK: - Deprecated aliases
-
-    @available(*, deprecated, renamed: "send(_:streaming:)")
-    public func chatStream(_ messages: [Message]) -> AsyncThrowingStream<String, Error> {
-        send(messages, streaming: true)
-    }
-
-    @available(*, deprecated, renamed: "send(_:streaming:)")
-    public func chat(_ messages: [Message]) async throws -> String {
-        guard let device = currentDevice, let token = currentToken else { throw BigBroError.notPaired }
-        return try await BigBroAPIClient(device: device).chat(token: token, messages: messages)
     }
 
     // MARK: - Private helpers

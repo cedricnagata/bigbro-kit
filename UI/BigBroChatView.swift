@@ -79,7 +79,10 @@ public struct BigBroChatView: View {
         defer { isLoading = false }
 
         do {
-            let reply = try await client.chat(conversationMessages)
+            var reply = ""
+            for try await delta in client.send(conversationMessages, streaming: false) {
+                reply += delta
+            }
             conversationMessages.append(.assistant(reply))
             displayMessages.append((id: UUID(), role: "assistant", text: reply))
         } catch {

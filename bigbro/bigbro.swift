@@ -5,4 +5,4 @@
 //   let client = BigBroClient()
 //   let devices = await client.discover()
 //   try await client.pair(with: devices[0])
-//   let reply = try await client.chat([.user("Hello")])
+//   for try await delta in client.send([.user("Hello")]) { print(delta) }
