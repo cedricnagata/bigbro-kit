@@ -17,10 +17,7 @@ let package = Package(
                 "Models/Message.swift",
                 "Models/Tool.swift",
                 "Discovery/BonjourBrowser.swift",
-                "Networking/BigBroAPIClient.swift",
-                "Storage/KeychainTokenStore.swift",
-                "UI/BigBroChatView.swift",
-                "UI/BigBroConnectionView.swift"
+                "Networking/PeerConnection.swift",
             ]
         )
     ]

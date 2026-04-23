@@ -3,202 +3,209 @@ import UIKit
 
 public enum BigBroError: Error, LocalizedError {
     case notPaired
-    case timeout
-    case missingToken
     case networkError
 
     public var errorDescription: String? {
         switch self {
         case .notPaired: return "Not paired with a BigBro device."
-        case .timeout: return "Pairing request timed out."
-        case .missingToken: return "Approval received but no token returned."
         case .networkError: return "Network error."
         }
     }
 }
 
-/// Session-scoped client for BigBro. No persistence across launches — every
-/// launch starts disconnected; the user taps Find BigBro to pair. The Mac
-/// remembers devices and auto-approves known ones, so "re-pair" is silent.
+public enum ConnectionState: Equatable {
+    case disconnected
+    case reconnecting   // path degraded; still showing UI, waiting for recovery or timeout
+    case connected
+}
+
+private enum ChatStreamEvent {
+    case delta(String)
+    case toolCalls([[String: Any]])
+}
+
+private final class RequestHolder: @unchecked Sendable {
+    var continuation: AsyncThrowingStream<ChatStreamEvent, Error>.Continuation?
+}
+
+/// Session-scoped client for BigBro. No persistence — every launch starts
+/// disconnected. The Mac remembers approved devices and auto-approves reconnects,
+/// so re-pairing is instant and silent.
+@MainActor
 public final class BigBroClient: ObservableObject {
     @Published public private(set) var connectedDevice: BigBroDevice?
-    @Published public private(set) var isConnected: Bool = false
+    @Published public private(set) var connectionState: ConnectionState = .disconnected
+
+    /// Convenience accessor; true only when fully connected (not reconnecting).
+    public var isConnected: Bool { connectionState == .connected }
 
     private let browser = BonjourBrowser()
-    private var presenceTask: Task<Void, Never>?
-    private var currentDevice: BigBroDevice?
-    private var currentToken: String?
+    private var peerConnection: PeerConnection?
+    private var messageTask: Task<Void, Never>?
+    private let activeRequest = RequestHolder()
 
-    public init() {}
+    public init() {
+        print("[BigBroClient] Initialized")
+    }
 
     // MARK: - Public API
 
     public func discover() async -> [BigBroDevice] {
-        await browser.discover()
+        print("[BigBroClient] Starting Bonjour discovery")
+        let devices = await browser.discover()
+        print("[BigBroClient] Discovered \(devices.count) device(s): \(devices.map { $0.name })")
+        return devices
     }
 
     public func pair(with device: BigBroDevice) async throws -> Bool {
-        let myId = deviceId()
-        let myName = await UIDevice.current.name
-        let api = BigBroAPIClient(device: device)
-
-        try await api.sendPairRequest(deviceName: myName, deviceId: myId)
-
-        let deadline = Date().addingTimeInterval(60)
-        while Date() < deadline {
-            try await Task.sleep(nanoseconds: 2_000_000_000)
-            let status = try await api.pollPairStatus(deviceId: myId)
-            switch status.status {
-            case "approved":
-                guard let token = status.token else { throw BigBroError.missingToken }
-                await MainActor.run {
-                    self.currentDevice = device
-                    self.currentToken = token
-                    self.connectedDevice = device
-                }
-                startPresence()
-                return true
-            case "denied":
-                return false
-            default:
-                continue
-            }
+        print("[BigBroClient] Pairing with \(device.name) at \(device.host):\(device.port)")
+        let conn = PeerConnection()
+        try await conn.connect(host: device.host, port: UInt16(device.port))
+        print("[BigBroClient] TCP connected, sending hello")
+        let approved = try await conn.sendHello(deviceId: deviceId(), deviceName: UIDevice.current.name)
+        print("[BigBroClient] pair result: \(approved ? "approved" : "denied")")
+        if approved {
+            peerConnection = conn
+            connectedDevice = device
+            connectionState = .connected
+            startMessageLoop(conn: conn)
+            await conn.startHeartbeat()
+            print("[BigBroClient] Paired and heartbeat started")
         }
-        throw BigBroError.timeout
+        return approved
     }
 
-    /// Send messages and stream the response.
-    /// When `tools` are provided the client runs the full agentic loop —
-    /// tool calls are executed locally and only the final text is yielded.
-    public func send(_ messages: [Message],
-                     streaming: Bool = true,
-                     tools: [BigBroTool] = []) -> AsyncThrowingStream<String, Error> {
-        guard let device = currentDevice, let token = currentToken else {
+    public func send(_ messages: [Message], streaming: Bool = true, tools: [BigBroTool] = []) -> AsyncThrowingStream<String, Error> {
+        guard let conn = peerConnection else {
+            print("[BigBroClient] send: not paired")
             return AsyncThrowingStream { $0.finish(throwing: BigBroError.notPaired) }
         }
-        let api = BigBroAPIClient(device: device)
-
-        // Fast paths when no tools are involved.
-        if tools.isEmpty {
-            if streaming {
-                return api.chatStream(token: token, messages: messages.map { $0.toDict() })
-            } else {
-                return AsyncThrowingStream { continuation in
-                    Task {
-                        do {
-                            let reply = try await api.chat(token: token, messages: messages.map { $0.toDict() })
-                            continuation.yield(reply)
-                            continuation.finish()
-                        } catch {
-                            continuation.finish(throwing: error)
-                        }
-                    }
-                }
-            }
-        }
-
-        // Agentic loop: keep calling the model until it stops requesting tools.
+        print("[BigBroClient] send: \(messages.count) message(s), streaming=\(streaming), tools=\(tools.count)")
         return AsyncThrowingStream { continuation in
-            Task {
-                var workingMessages: [[String: Any]] = messages.map { $0.toDict() }
+            Task { [conn] in
+                var workingMessages = messages.map { $0.toDict() }
                 do {
                     while true {
+                        let requestId = UUID().uuidString
+                        print("[BigBroClient] Request \(requestId.prefix(8)): sending to Mac")
+                        let eventStream = AsyncThrowingStream<ChatStreamEvent, Error> { cont in
+                            self.activeRequest.continuation = cont
+                        }
+                        var msg: [String: Any] = [
+                            "type": "request",
+                            "requestId": requestId,
+                            "messages": workingMessages,
+                            "streaming": streaming,
+                        ]
+                        if !tools.isEmpty {
+                            msg["tools"] = try tools.map { t -> Any in
+                                let d = try JSONEncoder().encode(t.definition)
+                                return try JSONSerialization.jsonObject(with: d)
+                            }
+                        }
+                        try await conn.send(msg)
+
                         var accumulated = ""
                         var pendingToolCalls: [[String: Any]]? = nil
-
-                        for try await event in api.chatEvents(token: token,
-                                                              messages: workingMessages,
-                                                              tools: tools) {
+                        for try await event in eventStream {
                             switch event {
                             case .delta(let text):
-                                if streaming {
-                                    continuation.yield(text)
-                                } else {
-                                    accumulated += text
-                                }
+                                if streaming { continuation.yield(text) } else { accumulated += text }
                             case .toolCalls(let calls):
+                                print("[BigBroClient] Tool calls received: \(calls.count)")
                                 pendingToolCalls = calls
                             }
                         }
-
                         guard let calls = pendingToolCalls else {
-                            // Model gave a text response — we're done.
+                            print("[BigBroClient] Request \(requestId.prefix(8)): done")
                             if !streaming { continuation.yield(accumulated) }
                             break
                         }
-
-                        // Append the assistant's tool-call turn to context.
-                        workingMessages.append([
-                            "role": "assistant",
-                            "content": "",
-                            "tool_calls": calls
-                        ])
-
-                        // Execute each requested tool and append results.
+                        print("[BigBroClient] Executing \(calls.count) tool call(s)")
+                        workingMessages.append(["role": "assistant", "content": "", "tool_calls": calls])
                         for call in calls {
                             guard let fn = call["function"] as? [String: Any],
                                   let name = fn["name"] as? String else { continue }
                             let args = (fn["arguments"] as? [String: Any]) ?? [:]
+                            print("[BigBroClient] Calling tool: \(name)")
                             if let tool = tools.first(where: { $0.definition.function.name == name }) {
                                 let result = await tool.handler(args)
-                                workingMessages.append([
-                                    "role": "tool",
-                                    "content": result,
-                                    "tool_name": name
-                                ])
+                                workingMessages.append(["role": "tool", "content": result, "tool_name": name])
                             }
                         }
-                        // Loop: send tool results back to the model.
                     }
                     continuation.finish()
                 } catch {
+                    print("[BigBroClient] send error: \(error)")
                     continuation.finish(throwing: error)
                 }
             }
         }
     }
 
-    /// Fully disconnect: cancel the presence stream and forget the device and
-    /// token. The user must Find BigBro again to reconnect.
     public func disconnect() {
-        presenceTask?.cancel()
-        presenceTask = nil
+        print("[BigBroClient] disconnect called")
+        messageTask?.cancel()
+        messageTask = nil
+        Task { await peerConnection?.disconnect() }
         teardown()
     }
 
-    // MARK: - Presence
+    // MARK: - Private
 
-    /// Open one presence stream. When it ends for any reason (Mac-initiated
-    /// disconnect, remove, network drop, 15s heartbeat timeout), tear down
-    /// fully — iOS forgets the device and token.
-    private func startPresence() {
-        presenceTask?.cancel()
-        presenceTask = Task { [weak self] in
-            guard let self else { return }
-            guard let device = self.currentDevice, let token = self.currentToken else {
-                await MainActor.run { self.isConnected = false }
-                return
-            }
-            let api = BigBroAPIClient(device: device)
+    private func startMessageLoop(conn: PeerConnection) {
+        messageTask?.cancel()
+        messageTask = Task { [weak self, conn] in
+            print("[BigBroClient] Message loop started")
+            let stream = await conn.messages()
             do {
-                try await api.streamPresence(token: token) {
-                    Task { @MainActor [weak self] in self?.isConnected = true }
+                for try await msg in stream {
+                    guard let self else { return }
+                    self.dispatch(msg)
                 }
             } catch {
-                print("[BigBroKit] presence stream error: \(error)")
+                print("[BigBroClient] Message loop error: \(error)")
             }
+            print("[BigBroClient] Message loop ended, tearing down")
             await MainActor.run { [weak self] in self?.teardown() }
         }
     }
 
-    private func teardown() {
-        isConnected = false
-        currentDevice = nil
-        currentToken = nil
-        connectedDevice = nil
+    private func dispatch(_ msg: [String: Any]) {
+        guard let type = msg["type"] as? String else { return }
+        print("[BigBroClient] dispatch: \(type)")
+        switch type {
+        case "_reconnecting":
+            connectionState = .reconnecting
+        case "_connected":
+            connectionState = .connected
+        case "chunk":
+            if let delta = msg["delta"] as? String {
+                activeRequest.continuation?.yield(.delta(delta))
+            }
+        case "toolCall":
+            if let calls = msg["calls"] as? [[String: Any]] {
+                activeRequest.continuation?.yield(.toolCalls(calls))
+            }
+        case "done":
+            activeRequest.continuation?.finish()
+            activeRequest.continuation = nil
+        case "error":
+            let errMsg = msg["message"] as? String ?? "unknown"
+            print("[BigBroClient] Server error: \(errMsg)")
+            activeRequest.continuation?.finish(throwing: BigBroError.networkError)
+            activeRequest.continuation = nil
+        default:
+            print("[BigBroClient] dispatch: unhandled type '\(type)'")
+        }
     }
 
-    // MARK: - Private helpers
+    private func teardown() {
+        print("[BigBroClient] teardown: connectionState → .disconnected")
+        connectionState = .disconnected
+        connectedDevice = nil
+        peerConnection = nil
+    }
 
     private func deviceId() -> String {
         UIDevice.current.identifierForVendor?.uuidString ?? UUID().uuidString
