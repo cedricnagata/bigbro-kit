@@ -36,7 +36,8 @@ struct BigBroAPIClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         let body = ChatRequest(
             token: token,
-            messages: messages.map { ChatRequest.Msg(role: $0.role.rawValue, content: $0.content) }
+            messages: messages.map { ChatRequest.Msg(role: $0.role.rawValue, content: $0.content) },
+            stream: false
         )
         request.httpBody = try JSONEncoder().encode(body)
         let (data, _) = try await URLSession.shared.data(for: request)
@@ -122,6 +123,13 @@ private struct ChatRequest: Encodable {
         let content: String
     }
     let messages: [Msg]
+    let stream: Bool?
+    
+    init(token: String, messages: [Msg], stream: Bool? = nil) {
+        self.token = token
+        self.messages = messages
+        self.stream = stream
+    }
 }
 
 private struct ChatResponse: Decodable {
