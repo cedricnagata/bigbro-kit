@@ -88,7 +88,8 @@ struct BigBroAPIClient {
                     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
                     let body = ChatRequest(
                         token: token,
-                        messages: messages.map { ChatRequest.Msg(role: $0.role.rawValue, content: $0.content) }
+                        messages: messages.map { ChatRequest.Msg(role: $0.role.rawValue, content: $0.content) },
+                        stream: true
                     )
                     request.httpBody = try JSONEncoder().encode(body)
                     let (bytes, _) = try await URLSession.shared.bytes(for: request)
