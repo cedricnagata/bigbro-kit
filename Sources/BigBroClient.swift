@@ -75,7 +75,27 @@ public final class BigBroClient: ObservableObject {
         return approved
     }
 
-    public func send(_ messages: [Message], streaming: Bool = true, tools: [BigBroTool] = []) -> AsyncThrowingStream<String, Error> {
+    /// Send a chat request to the paired Mac, proxied to Ollama's `/api/chat`.
+    ///
+    /// - Parameters:
+    ///   - messages: Conversation history, including any tool results.
+    ///   - model: Override the Mac's default model for this request.
+    ///   - streaming: When `true` (default), yields text deltas as they arrive.
+    ///   - tools: Tools the model may call; the agentic loop runs transparently.
+    ///   - format: Constrain the response to JSON or a specific JSON schema.
+    ///   - options: Low-level Ollama model parameters (temperature, top_k, etc.).
+    ///   - think: Enable chain-of-thought reasoning (supported models only).
+    ///   - keepAlive: How long Ollama should keep the model loaded after the request.
+    public func send(
+        _ messages: [Message],
+        model: String? = nil,
+        streaming: Bool = true,
+        tools: [BigBroTool] = [],
+        format: OllamaFormat? = nil,
+        options: OllamaOptions? = nil,
+        think: Bool? = nil,
+        keepAlive: String? = nil
+    ) -> AsyncThrowingStream<String, Error> {
         guard let conn = peerConnection else {
             print("[BigBroClient] send: not paired")
             return AsyncThrowingStream { $0.finish(throwing: BigBroError.notPaired) }
@@ -103,6 +123,11 @@ public final class BigBroClient: ObservableObject {
                                 return try JSONSerialization.jsonObject(with: d)
                             }
                         }
+                        if let model     { msg["model"] = model }
+                        if let format    { msg["format"] = format.toJSONValue() }
+                        if let options   { msg["options"] = options.toDict() }
+                        if let think     { msg["think"] = think }
+                        if let keepAlive { msg["keep_alive"] = keepAlive }
                         try await conn.send(msg)
 
                         var accumulated = ""
@@ -137,6 +162,87 @@ public final class BigBroClient: ObservableObject {
                     continuation.finish()
                 } catch {
                     print("[BigBroClient] send error: \(error)")
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// Send a raw generation request to the paired Mac, proxied to Ollama's `/api/generate`.
+    ///
+    /// Unlike `send()`, there is no tool-call loop — `/api/generate` does not support tools.
+    ///
+    /// - Parameters:
+    ///   - prompt: The prompt string to generate a response for.
+    ///   - images: Images to include with the request (multimodal models only).
+    ///   - suffix: Text to append after the model's response.
+    ///   - system: Override the system prompt for this request.
+    ///   - template: Override the prompt template.
+    ///   - model: Override the Mac's default model for this request.
+    ///   - format: Constrain the response to JSON or a specific JSON schema.
+    ///   - options: Low-level Ollama model parameters.
+    ///   - raw: When `true`, skip prompt formatting.
+    ///   - think: Enable chain-of-thought reasoning.
+    ///   - keepAlive: How long Ollama should keep the model loaded after the request.
+    ///   - streaming: When `true` (default), yields text deltas as they arrive.
+    public func generate(
+        prompt: String,
+        images: [Data] = [],
+        suffix: String? = nil,
+        system: String? = nil,
+        template: String? = nil,
+        model: String? = nil,
+        format: OllamaFormat? = nil,
+        options: OllamaOptions? = nil,
+        raw: Bool? = nil,
+        think: Bool? = nil,
+        keepAlive: String? = nil,
+        streaming: Bool = true
+    ) -> AsyncThrowingStream<String, Error> {
+        guard let conn = peerConnection else {
+            print("[BigBroClient] generate: not paired")
+            return AsyncThrowingStream { $0.finish(throwing: BigBroError.notPaired) }
+        }
+        print("[BigBroClient] generate: prompt='\(prompt.prefix(40))…', streaming=\(streaming)")
+        return AsyncThrowingStream { continuation in
+            Task { [conn] in
+                let requestId = UUID().uuidString
+                let eventStream = AsyncThrowingStream<ChatStreamEvent, Error> { cont in
+                    self.activeRequest.continuation = cont
+                }
+                var msg: [String: Any] = [
+                    "type": "generateRequest",
+                    "requestId": requestId,
+                    "prompt": prompt,
+                    "streaming": streaming,
+                ]
+                if !images.isEmpty {
+                    msg["images"] = images.map { $0.base64EncodedString() }
+                }
+                if let suffix    { msg["suffix"] = suffix }
+                if let system    { msg["system"] = system }
+                if let template  { msg["template"] = template }
+                if let model     { msg["model"] = model }
+                if let format    { msg["format"] = format.toJSONValue() }
+                if let options   { msg["options"] = options.toDict() }
+                if let raw       { msg["raw"] = raw }
+                if let think     { msg["think"] = think }
+                if let keepAlive { msg["keep_alive"] = keepAlive }
+                do {
+                    try await conn.send(msg)
+                    var accumulated = ""
+                    for try await event in eventStream {
+                        switch event {
+                        case .delta(let text):
+                            if streaming { continuation.yield(text) } else { accumulated += text }
+                        case .toolCalls:
+                            break // /api/generate does not emit tool calls; ignore defensively
+                        }
+                    }
+                    if !streaming { continuation.yield(accumulated) }
+                    continuation.finish()
+                } catch {
+                    print("[BigBroClient] generate error: \(error)")
                     continuation.finish(throwing: error)
                 }
             }

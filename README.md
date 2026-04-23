@@ -1,6 +1,6 @@
 # BigBroKit
 
-An iOS Swift framework for connecting to a [BigBro](https://github.com/nagata-inc/bigbro) Mac and offloading LLM inference over the local network.
+An iOS Swift Package for connecting to a [BigBro](https://github.com/nagata-inc/bigbro) Mac and offloading LLM inference over the local network. BigBroKit discovers the Mac via Bonjour, establishes a persistent TCP connection, and proxies requests to the Mac's local [Ollama](https://ollama.ai) instance — covering both `/api/chat` (with full tool-calling support) and `/api/generate`.
 
 ## Requirements
 
@@ -35,99 +35,164 @@ Add the following to your app's `Info.plist`:
 </array>
 ```
 
-## Usage
-
-`BigBroClient` is an `ObservableObject`, so you can observe its state directly from SwiftUI:
+## Quick start
 
 ```swift
-import SwiftUI
 import BigBroKit
 
-struct ContentView: View {
-    @StateObject private var client = BigBroClient()
+let client = BigBroClient()
 
-    var body: some View {
-        VStack {
-            if client.isConnected {
-                Text("Connected to \(client.connectedDevice?.name ?? "")")
-            } else {
-                Button("Find BigBro") {
-                    Task {
-                        let devices = await client.discover()
-                        if let mac = devices.first {
-                            _ = try? await client.pair(with: mac)
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-```
+// 1. Discover BigBro Macs on the local network
+let devices = await client.discover()
 
-Sending messages:
+// 2. Pair with one (shows an approval dialog on the Mac on first connect)
+let approved = try await client.pair(with: devices[0])
 
-```swift
+// 3. Send a chat request — deltas stream back one token at a time
 let messages: [Message] = [.user("Explain Swift concurrency in one paragraph.")]
-
-// Streaming (default) — deltas arrive one token at a time
 for try await delta in client.send(messages) {
     print(delta, terminator: "")
 }
-
-// Non-streaming — full response arrives as a single chunk
-for try await reply in client.send(messages, streaming: false) {
-    print(reply)
-}
 ```
 
-## Session model
-
-BigBroKit keeps **no persistent state** — no stored device, no stored token, no known-devices history. Every launch starts disconnected; the user has to Find BigBro again.
-
-The Mac, however, remembers every device it has approved. When an iOS device re-pairs after a fresh launch, the Mac auto-approves silently (no dialog, no user tap), so the re-connect flow feels instant.
-
-A presence stream (`/presence` SSE) keeps `isConnected` in sync. The stream ends — and the client fully tears down (device + token forgotten) — when any of these happens:
-
-- The Mac user clicks **Disconnect** or **Remove** on that device
-- The iOS device doesn't receive a heartbeat for 15 seconds
-- The network drops
-
-## API
+## API reference
 
 ### `BigBroClient`
 
+`@MainActor ObservableObject` — one instance per session.
+
 ```swift
-public final class BigBroClient: ObservableObject {
-    @Published public private(set) var connectedDevice: BigBroDevice?
-    @Published public private(set) var isConnected: Bool
+// State
+@Published var connectedDevice: BigBroDevice?
+@Published var connectionState: ConnectionState   // .disconnected | .reconnecting | .connected
+var isConnected: Bool
 
-    // Discover BigBro Macs on the local network (5s Bonjour timeout)
-    public func discover() async -> [BigBroDevice]
+// Discovery & pairing
+func discover() async -> [BigBroDevice]
+func pair(with device: BigBroDevice) async throws -> Bool
+func disconnect()
 
-    // Send a pair request and poll for approval (60s timeout).
-    // Returns true if approved, false if denied.
-    // On approval, opens the presence stream and sets isConnected=true.
-    public func pair(with device: BigBroDevice) async throws -> Bool
+// Inference — /api/chat
+func send(
+    _ messages: [Message],
+    model: String? = nil,
+    streaming: Bool = true,
+    tools: [BigBroTool] = [],
+    format: OllamaFormat? = nil,
+    options: OllamaOptions? = nil,
+    think: Bool? = nil,
+    keepAlive: String? = nil
+) -> AsyncThrowingStream<String, Error>
 
-    // Send messages. `streaming: true` yields token deltas as they arrive;
-    // `streaming: false` yields the full response as a single element.
-    public func send(_ messages: [Message],
-                     streaming: Bool = true) -> AsyncThrowingStream<String, Error>
-
-    // Close the presence stream and forget device + token.
-    public func disconnect()
-}
+// Inference — /api/generate
+func generate(
+    prompt: String,
+    images: [Data] = [],
+    suffix: String? = nil,
+    system: String? = nil,
+    template: String? = nil,
+    model: String? = nil,
+    format: OllamaFormat? = nil,
+    options: OllamaOptions? = nil,
+    raw: Bool? = nil,
+    think: Bool? = nil,
+    keepAlive: String? = nil,
+    streaming: Bool = true
+) -> AsyncThrowingStream<String, Error>
 ```
 
 ### `Message`
 
 ```swift
 public struct Message {
-    public static func user(_ content: String) -> Message
-    public static func assistant(_ content: String) -> Message
-    public static func system(_ content: String) -> Message
+    public enum Role: String { case user, assistant, system, tool }
+
+    public let role: Role
+    public let content: String
+    public let images: [Data]?       // base64-encoded on the wire; pass raw Data here
+    public let toolCalls: [[String: Any]]?  // for assistant messages containing tool calls
+    public let toolName: String?     // for tool-role result messages
+    public let thinking: String?     // chain-of-thought text (thinking models only)
+
+    // Convenience constructors
+    static func user(_ content: String, images: [Data] = []) -> Message
+    static func assistant(_ content: String) -> Message
+    static func system(_ content: String) -> Message
+    static func tool(name: String, content: String) -> Message
 }
+```
+
+### `BigBroTool`
+
+Tools are defined with a JSON-schema-compatible description and a Swift async handler that runs locally on the iOS device. The SDK's agentic loop calls handlers transparently — callers just consume the final text stream.
+
+```swift
+let dateTool = BigBroTool(
+    definition: BigBroTool.Definition(
+        name: "get_current_date",
+        description: "Returns the current date and time.",
+        parameters: BigBroTool.Definition.Parameters()
+    ),
+    handler: { _ in
+        DateFormatter.localizedString(from: Date(), dateStyle: .full, timeStyle: .medium)
+    }
+)
+
+// Tools with parameters:
+let searchTool = BigBroTool(
+    definition: BigBroTool.Definition(
+        name: "web_search",
+        description: "Search the web.",
+        parameters: BigBroTool.Definition.Parameters(
+            properties: ["query": .init(type: "string", description: "Search query")],
+            required: ["query"]
+        )
+    ),
+    handler: { args in
+        let query = args["query"] as? String ?? ""
+        // ... perform search ...
+        return results
+    }
+)
+
+// Pass tools to send():
+for try await delta in client.send(history, tools: [dateTool, searchTool]) {
+    print(delta, terminator: "")
+}
+```
+
+### `OllamaOptions`
+
+Maps directly to Ollama's `options` request field. All fields are optional.
+
+```swift
+let opts = OllamaOptions(temperature: 0.7, topK: 40, seed: 42)
+for try await delta in client.send(messages, options: opts) { ... }
+```
+
+| Field | Ollama key | Type |
+|---|---|---|
+| `temperature` | `temperature` | `Double` |
+| `topK` | `top_k` | `Int` |
+| `topP` | `top_p` | `Double` |
+| `seed` | `seed` | `Int` |
+| `numPredict` | `num_predict` | `Int` |
+| `stop` | `stop` | `[String]` |
+| `repeatPenalty` | `repeat_penalty` | `Double` |
+| `presencePenalty` | `presence_penalty` | `Double` |
+| `frequencyPenalty` | `frequency_penalty` | `Double` |
+| `numCtx` | `num_ctx` | `Int` |
+| `numThread` | `num_thread` | `Int` |
+
+### `OllamaFormat`
+
+```swift
+// Plain JSON mode
+client.send(messages, format: .json)
+
+// Structured JSON schema (serialize the schema dict to Data first)
+let schemaData = try JSONSerialization.data(withJSONObject: mySchema)
+client.send(messages, format: .jsonSchema(schemaData))
 ```
 
 ### `BigBroDevice`
@@ -141,13 +206,53 @@ public struct BigBroDevice: Identifiable, Hashable {
 }
 ```
 
-### Errors
+### `BigBroError`
 
 ```swift
 public enum BigBroError: LocalizedError {
-    case notPaired       // send() called before pairing
-    case timeout         // pair() timed out waiting for approval
-    case missingToken    // approved but no token returned
-    case networkError    // network-level failure
+    case notPaired     // send()/generate() called before pairing
+    case networkError  // network-level failure or heartbeat timeout
 }
+```
+
+## Session model
+
+BigBroKit keeps **no persistent state** — no stored device, no stored credentials. Every launch starts disconnected.
+
+The Mac, however, remembers every device it has approved. When the same iOS device re-pairs after a fresh launch, the Mac auto-approves silently (no dialog, no delay), so reconnects feel instant.
+
+The client tears down automatically — returning `connectionState` to `.disconnected` — when any of these happens:
+
+- The Mac user clicks **Disconnect** or **Remove** for that device
+- The iOS device misses heartbeat pongs for more than 25 seconds
+- The network drops and does not recover
+
+While the network path is degraded (but not yet timed out), `connectionState` is `.reconnecting`. The UI can show a spinner during this window; the client recovers automatically if the path comes back in time.
+
+## Tool calling
+
+When tools are passed to `send()`, the SDK runs a transparent agentic loop:
+
+1. Sends the request to the Mac
+2. Mac streams the response; if Ollama returns tool calls, the Mac forwards them to the iOS client
+3. iOS executes each tool handler locally and appends the results to the message history
+4. Re-sends the updated history to the Mac
+5. Repeats until Ollama returns a final text response with no tool calls
+6. Yields all text deltas to the caller's `AsyncThrowingStream`
+
+Callers never see tool calls — only the final streamed text.
+
+## Source layout
+
+```
+bigbro-kit/
+├── Sources/
+│   ├── BigBroClient.swift      — main client (ObservableObject)
+│   ├── BigBroDevice.swift      — discovered device model
+│   ├── BonjourBrowser.swift    — Bonjour/mDNS discovery
+│   ├── Message.swift           — chat message model
+│   ├── OllamaOptions.swift     — generation options + format enum
+│   ├── PeerConnection.swift    — TCP actor (4-byte framed JSON)
+│   └── Tool.swift              — BigBroTool definition + handler
+└── Package.swift
 ```
