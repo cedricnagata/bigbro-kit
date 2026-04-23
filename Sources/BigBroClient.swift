@@ -253,8 +253,9 @@ public final class BigBroClient: ObservableObject {
         print("[BigBroClient] disconnect called")
         messageTask?.cancel()
         messageTask = nil
-        Task { await peerConnection?.disconnect() }
+        let conn = peerConnection  // capture before teardown() clears it
         teardown()
+        Task { await conn?.disconnect() }
     }
 
     // MARK: - Private
