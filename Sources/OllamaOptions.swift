@@ -48,7 +48,7 @@ public struct OllamaOptions: Sendable {
         if let v = topP             { d["top_p"] = v }
         if let v = seed             { d["seed"] = v }
         if let v = numPredict       { d["num_predict"] = v }
-        if let v = stop             { d["stop"] = v }
+        if let v = stop, !v.isEmpty { d["stop"] = v }
         if let v = repeatPenalty    { d["repeat_penalty"] = v }
         if let v = presencePenalty  { d["presence_penalty"] = v }
         if let v = frequencyPenalty { d["frequency_penalty"] = v }

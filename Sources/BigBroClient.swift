@@ -102,8 +102,15 @@ public final class BigBroClient: ObservableObject {
         }
         print("[BigBroClient] send: \(messages.count) message(s), streaming=\(streaming), tools=\(tools.count)")
         return AsyncThrowingStream { continuation in
+            // Cancel any in-flight request before taking over activeRequest
+            self.activeRequest.continuation?.finish(throwing: CancellationError())
             Task { [conn] in
                 var workingMessages = messages.map { $0.toDict() }
+                // Encode tool definitions once — they don't change between loop iterations
+                let encodedTools: [Any] = (try? tools.map { t -> Any in
+                    let d = try JSONEncoder().encode(t.definition)
+                    return try JSONSerialization.jsonObject(with: d)
+                }) ?? []
                 do {
                     while true {
                         let requestId = UUID().uuidString
@@ -117,12 +124,7 @@ public final class BigBroClient: ObservableObject {
                             "messages": workingMessages,
                             "streaming": streaming,
                         ]
-                        if !tools.isEmpty {
-                            msg["tools"] = try tools.map { t -> Any in
-                                let d = try JSONEncoder().encode(t.definition)
-                                return try JSONSerialization.jsonObject(with: d)
-                            }
-                        }
+                        if !encodedTools.isEmpty { msg["tools"] = encodedTools }
                         if let model     { msg["model"] = model }
                         if let format    { msg["format"] = format.toJSONValue() }
                         if let options   { msg["options"] = options.toDict() }
@@ -147,15 +149,21 @@ public final class BigBroClient: ObservableObject {
                             break
                         }
                         print("[BigBroClient] Executing \(calls.count) tool call(s)")
-                        workingMessages.append(["role": "assistant", "content": "", "tool_calls": calls])
+                        workingMessages.append(Message(role: .assistant, content: "", toolCalls: calls).toDict())
                         for call in calls {
                             guard let fn = call["function"] as? [String: Any],
-                                  let name = fn["name"] as? String else { continue }
+                                  let name = fn["name"] as? String else {
+                                print("[BigBroClient] Malformed tool call, appending empty result")
+                                workingMessages.append(Message.tool(name: "unknown", content: "error: malformed tool call").toDict())
+                                continue
+                            }
                             let args = (fn["arguments"] as? [String: Any]) ?? [:]
                             print("[BigBroClient] Calling tool: \(name)")
                             if let tool = tools.first(where: { $0.definition.function.name == name }) {
                                 let result = await tool.handler(args)
-                                workingMessages.append(["role": "tool", "content": result, "tool_name": name])
+                                workingMessages.append(Message.tool(name: name, content: result).toDict())
+                            } else {
+                                workingMessages.append(Message.tool(name: name, content: "error: unknown tool '\(name)'").toDict())
                             }
                         }
                     }
