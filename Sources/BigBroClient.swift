@@ -43,9 +43,11 @@ public final class BigBroClient: ObservableObject {
     private var peerConnection: PeerConnection?
     private var messageTask: Task<Void, Never>?
     private let activeRequest = RequestHolder()
+    private let requiredModels: [String]
 
-    public init() {
-        print("[BigBroClient] Initialized")
+    public init(requiredModels: [String] = []) {
+        self.requiredModels = requiredModels
+        print("[BigBroClient] Initialized with \(requiredModels.count) required model(s)")
     }
 
     // MARK: - Public API
@@ -62,7 +64,7 @@ public final class BigBroClient: ObservableObject {
         let conn = PeerConnection()
         try await conn.connect(host: device.host, port: UInt16(device.port))
         print("[BigBroClient] TCP connected, sending hello")
-        let approved = try await conn.sendHello(deviceId: deviceId(), deviceName: UIDevice.current.name)
+        let approved = try await conn.sendHello(deviceId: deviceId(), deviceName: UIDevice.current.name, requiredModels: requiredModels)
         print("[BigBroClient] pair result: \(approved ? "approved" : "denied")")
         if approved {
             peerConnection = conn

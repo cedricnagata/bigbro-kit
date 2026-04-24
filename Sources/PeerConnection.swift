@@ -38,9 +38,11 @@ actor PeerConnection {
     }
 
     /// Send hello and wait for helloAck. Returns true if approved, false if denied.
-    func sendHello(deviceId: String, deviceName: String) async throws -> Bool {
+    func sendHello(deviceId: String, deviceName: String, requiredModels: [String] = []) async throws -> Bool {
         print("[PeerConnection] Sending hello (deviceId=\(deviceId.prefix(8)), deviceName=\(deviceName))")
-        try sendRaw(["type": "hello", "deviceId": deviceId, "deviceName": deviceName])
+        var msg: [String: Any] = ["type": "hello", "deviceId": deviceId, "deviceName": deviceName]
+        if !requiredModels.isEmpty { msg["requiredModels"] = requiredModels }
+        try sendRaw(msg)
         print("[PeerConnection] Hello sent, waiting for helloAck")
         let result = try await withCheckedThrowingContinuation { cont in
             self.helloAckContinuation = cont
