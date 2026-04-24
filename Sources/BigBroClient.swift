@@ -86,7 +86,7 @@ public final class BigBroClient: ObservableObject {
     ///   - options: Low-level Ollama model parameters (temperature, top_k, etc.).
     ///   - think: Enable chain-of-thought reasoning (supported models only).
     ///   - keepAlive: How long Ollama should keep the model loaded after the request.
-    public func send(
+    public func chat(
         _ messages: [Message],
         model: String? = nil,
         streaming: Bool = true,
@@ -97,10 +97,10 @@ public final class BigBroClient: ObservableObject {
         keepAlive: String? = nil
     ) -> AsyncThrowingStream<String, Error> {
         guard let conn = peerConnection else {
-            print("[BigBroClient] send: not paired")
+            print("[BigBroClient] chat: not paired")
             return AsyncThrowingStream { $0.finish(throwing: BigBroError.notPaired) }
         }
-        print("[BigBroClient] send: \(messages.count) message(s), streaming=\(streaming), tools=\(tools.count)")
+        print("[BigBroClient] chat: \(messages.count) message(s), streaming=\(streaming), tools=\(tools.count)")
         return AsyncThrowingStream { continuation in
             // Cancel any in-flight request before taking over activeRequest
             self.activeRequest.continuation?.finish(throwing: CancellationError())
@@ -178,7 +178,7 @@ public final class BigBroClient: ObservableObject {
 
     /// Send a raw generation request to the paired Mac, proxied to Ollama's `/api/generate`.
     ///
-    /// Unlike `send()`, there is no tool-call loop — `/api/generate` does not support tools.
+    /// Unlike `chat()`, there is no tool-call loop — `/api/generate` does not support tools.
     ///
     /// - Parameters:
     ///   - prompt: The prompt string to generate a response for.

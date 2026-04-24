@@ -1,6 +1,6 @@
 # BigBroKit
 
-An iOS Swift Package for connecting to a [BigBro](https://github.com/nagata-inc/bigbro) Mac and offloading LLM inference over the local network. BigBroKit discovers the Mac via Bonjour, establishes a persistent TCP connection, and proxies requests to the Mac's local [Ollama](https://ollama.ai) instance — covering both `/api/chat` (with full tool-calling support) and `/api/generate`.
+An iOS Swift Package for connecting to a [BigBro](https://github.com/nagata-inc/bigbro) Mac and running LLM inference over the local network. BigBroKit discovers the Mac via Bonjour, establishes a persistent TCP connection, and proxies requests to the Mac's local [Ollama](https://ollama.ai) instance — covering both `/api/chat` (with full tool-calling support) and `/api/generate`.
 
 ## Requirements
 
@@ -12,9 +12,9 @@ An iOS Swift Package for connecting to a [BigBro](https://github.com/nagata-inc/
 
 ### Swift Package Manager
 
-Add BigBroKit as a dependency in Xcode: **File → Add Package Dependencies** and enter the repository URL.
+**Xcode:** File → Add Package Dependencies, enter the repository URL.
 
-Or add it to your `Package.swift`:
+**Package.swift:**
 
 ```swift
 dependencies: [
@@ -42,16 +42,50 @@ import BigBroKit
 
 let client = BigBroClient()
 
-// 1. Discover BigBro Macs on the local network
+// 1. Discover BigBro Macs on the local network (5-second scan)
 let devices = await client.discover()
+guard !devices.isEmpty else { return }
 
-// 2. Pair with one (shows an approval dialog on the Mac on first connect)
+// 2. Pair — shows an approval dialog on the Mac the first time; silent thereafter
 let approved = try await client.pair(with: devices[0])
+guard approved else { return }
 
-// 3. Send a chat request — deltas stream back one token at a time
-let messages: [Message] = [.user("Explain Swift concurrency in one paragraph.")]
-for try await delta in client.send(messages) {
+// 3. Stream a chat response one token at a time
+for try await delta in client.chat([.user("Explain Swift concurrency in one paragraph.")]) {
     print(delta, terminator: "")
+}
+```
+
+## Connection lifecycle
+
+`BigBroClient` keeps **no persistent state** — every launch starts disconnected. The Mac remembers every device it has approved, so re-pairing after a fresh app launch is instant and silent (no dialog, no delay).
+
+```
+.disconnected → pair() → .connected → (network degrades) → .reconnecting → (recovers) → .connected
+                                                                          → (timeout)   → .disconnected
+```
+
+The client tears down automatically — returning `connectionState` to `.disconnected` — when any of these happens:
+
+- The Mac user clicks **Disconnect** or **Remove** for that device
+- No heartbeat pong is received for more than 25 seconds
+- The network drops and does not recover within the heartbeat window
+
+While the path is degraded but not yet timed out, `connectionState` is `.reconnecting`. The client recovers automatically if the connection comes back in time.
+
+Observe state changes in SwiftUI with `@ObservedObject` or `@StateObject`:
+
+```swift
+struct ContentView: View {
+    @StateObject private var client = BigBroClient()
+
+    var body: some View {
+        switch client.connectionState {
+        case .disconnected:  Text("Not connected")
+        case .reconnecting:  ProgressView("Reconnecting…")
+        case .connected:     Text("Connected to \(client.connectedDevice?.name ?? "")")
+        }
+    }
 }
 ```
 
@@ -59,47 +93,68 @@ for try await delta in client.send(messages) {
 
 ### `BigBroClient`
 
-`@MainActor ObservableObject` — one instance per session.
+`@MainActor ObservableObject`. Create one instance per session.
+
+#### State
 
 ```swift
-// State
 @Published var connectedDevice: BigBroDevice?
 @Published var connectionState: ConnectionState   // .disconnected | .reconnecting | .connected
-var isConnected: Bool
+var isConnected: Bool                             // true only when fully .connected
+```
 
-// Discovery & pairing
+#### Discovery and pairing
+
+```swift
+// Scans the local network for BigBro Macs. Times out after ~5 seconds.
 func discover() async -> [BigBroDevice]
-func pair(with device: BigBroDevice) async throws -> Bool
-func disconnect()
 
-// Inference — /api/chat
+// Connects and performs the hello/helloAck handshake.
+// Returns true if the Mac approved, false if denied.
+// Throws on network failure.
+func pair(with device: BigBroDevice) async throws -> Bool
+
+// Sends bye, stops the heartbeat, and tears down the connection.
+func disconnect()
+```
+
+#### Inference — `/api/chat`
+
+```swift
 func send(
     _ messages: [Message],
-    model: String? = nil,
-    streaming: Bool = true,
-    tools: [BigBroTool] = [],
+    model: String? = nil,         // overrides the Mac's default model
+    streaming: Bool = true,       // false → single yield of the full response
+    tools: [BigBroTool] = [],     // triggers the agentic tool-call loop
     format: OllamaFormat? = nil,
     options: OllamaOptions? = nil,
-    think: Bool? = nil,
-    keepAlive: String? = nil
+    think: Bool? = nil,           // chain-of-thought (supported models only)
+    keepAlive: String? = nil      // how long Ollama keeps the model loaded
 ) -> AsyncThrowingStream<String, Error>
+```
 
-// Inference — /api/generate
+#### Inference — `/api/generate`
+
+```swift
 func generate(
     prompt: String,
-    images: [Data] = [],
+    images: [Data] = [],          // multimodal models only; pass raw Data, base64 is handled internally
     suffix: String? = nil,
     system: String? = nil,
     template: String? = nil,
     model: String? = nil,
     format: OllamaFormat? = nil,
     options: OllamaOptions? = nil,
-    raw: Bool? = nil,
+    raw: Bool? = nil,             // skip prompt formatting
     think: Bool? = nil,
     keepAlive: String? = nil,
     streaming: Bool = true
 ) -> AsyncThrowingStream<String, Error>
 ```
+
+`generate()` does not support tools — `/api/generate` is a raw completion endpoint.
+
+---
 
 ### `Message`
 
@@ -109,57 +164,73 @@ public struct Message {
 
     public let role: Role
     public let content: String
-    public let images: [Data]?       // base64-encoded on the wire; pass raw Data here
-    public let toolCalls: [[String: Any]]?  // for assistant messages containing tool calls
-    public let toolName: String?     // for tool-role result messages
-    public let thinking: String?     // chain-of-thought text (thinking models only)
-
-    // Convenience constructors
-    static func user(_ content: String, images: [Data] = []) -> Message
-    static func assistant(_ content: String) -> Message
-    static func system(_ content: String) -> Message
-    static func tool(name: String, content: String) -> Message
+    public let images: [Data]?              // raw Data; base64-encoded on the wire
+    public let toolCalls: [[String: Any]]?  // assistant messages containing tool calls
+    public let toolName: String?            // tool-role result messages
+    public let thinking: String?            // chain-of-thought text (thinking models only)
 }
 ```
 
-### `BigBroTool`
-
-Tools are defined with a JSON-schema-compatible description and a Swift async handler that runs locally on the iOS device. The SDK's agentic loop calls handlers transparently — callers just consume the final text stream.
+**Convenience constructors:**
 
 ```swift
+.user("Hello")
+.user("Describe this image.", images: [imageData])
+.assistant("Hello back!")
+.system("You are a concise assistant.")
+.tool(name: "get_weather", content: "72°F, sunny")
+```
+
+---
+
+### `BigBroTool`
+
+Tools are defined with a JSON-schema description and a Swift `async` handler that runs locally on the iOS device. Pass one or more to `send()` and the SDK's agentic loop handles tool execution transparently — callers only see the final text stream.
+
+```swift
+// Tool with no parameters
 let dateTool = BigBroTool(
     definition: BigBroTool.Definition(
         name: "get_current_date",
-        description: "Returns the current date and time.",
-        parameters: BigBroTool.Definition.Parameters()
+        description: "Returns the current date and time."
     ),
     handler: { _ in
         DateFormatter.localizedString(from: Date(), dateStyle: .full, timeStyle: .medium)
     }
 )
 
-// Tools with parameters:
-let searchTool = BigBroTool(
+// Tool with parameters
+let weatherTool = BigBroTool(
     definition: BigBroTool.Definition(
-        name: "web_search",
-        description: "Search the web.",
+        name: "get_weather",
+        description: "Returns current weather for a city.",
         parameters: BigBroTool.Definition.Parameters(
-            properties: ["query": .init(type: "string", description: "Search query")],
-            required: ["query"]
+            properties: [
+                "city": .init(type: "string", description: "City name")
+            ],
+            required: ["city"]
         )
     ),
     handler: { args in
-        let query = args["query"] as? String ?? ""
-        // ... perform search ...
-        return results
+        let city = args["city"] as? String ?? ""
+        return await fetchWeather(for: city)
     }
 )
 
-// Pass tools to send():
-for try await delta in client.send(history, tools: [dateTool, searchTool]) {
+for try await delta in client.chat(history, tools: [dateTool, weatherTool]) {
     print(delta, terminator: "")
 }
 ```
+
+**Agentic loop:** When Ollama returns tool calls, the SDK automatically:
+1. Executes each tool handler locally on the device
+2. Appends the results to the message history
+3. Re-sends the updated history
+4. Repeats until Ollama returns a final text response
+
+The caller never sees intermediate tool calls — only the final streamed text.
+
+---
 
 ### `OllamaOptions`
 
@@ -167,10 +238,10 @@ Maps directly to Ollama's `options` request field. All fields are optional.
 
 ```swift
 let opts = OllamaOptions(temperature: 0.7, topK: 40, seed: 42)
-for try await delta in client.send(messages, options: opts) { ... }
+for try await delta in client.chat(messages, options: opts) { ... }
 ```
 
-| Field | Ollama key | Type |
+| Swift property | Ollama key | Type |
 |---|---|---|
 | `temperature` | `temperature` | `Double` |
 | `topK` | `top_k` | `Int` |
@@ -184,75 +255,119 @@ for try await delta in client.send(messages, options: opts) { ... }
 | `numCtx` | `num_ctx` | `Int` |
 | `numThread` | `num_thread` | `Int` |
 
+---
+
 ### `OllamaFormat`
 
 ```swift
 // Plain JSON mode
-client.send(messages, format: .json)
+client.chat(messages, format: .json)
 
-// Structured JSON schema (serialize the schema dict to Data first)
-let schemaData = try JSONSerialization.data(withJSONObject: mySchema)
-client.send(messages, format: .jsonSchema(schemaData))
+// Structured output with a JSON schema
+let schemaData = try JSONSerialization.data(withJSONObject: [
+    "type": "object",
+    "properties": ["name": ["type": "string"], "age": ["type": "integer"]],
+    "required": ["name", "age"]
+])
+client.chat(messages, format: .jsonSchema(schemaData))
 ```
+
+---
 
 ### `BigBroDevice`
 
 ```swift
 public struct BigBroDevice: Identifiable, Hashable {
-    public let id: String
+    public let id: String     // service name (Mac hostname)
     public let name: String   // e.g. "Cedric's MacBook Pro"
-    public let host: String
-    public let port: Int
+    public let host: String   // resolved mDNS hostname
+    public let port: Int      // always 8765
 }
 ```
+
+---
 
 ### `BigBroError`
 
 ```swift
 public enum BigBroError: LocalizedError {
-    case notPaired     // send()/generate() called before pairing
-    case networkError  // network-level failure or heartbeat timeout
+    case notPaired      // send() or generate() called before a successful pair()
+    case networkError   // TCP failure or heartbeat timeout
 }
 ```
 
-## Session model
+---
 
-BigBroKit keeps **no persistent state** — no stored device, no stored credentials. Every launch starts disconnected.
+### `ConnectionState`
 
-The Mac, however, remembers every device it has approved. When the same iOS device re-pairs after a fresh launch, the Mac auto-approves silently (no dialog, no delay), so reconnects feel instant.
+```swift
+public enum ConnectionState: Equatable {
+    case disconnected
+    case reconnecting   // path degraded; recovering or timing out
+    case connected
+}
+```
 
-The client tears down automatically — returning `connectionState` to `.disconnected` — when any of these happens:
+## Error handling
 
-- The Mac user clicks **Disconnect** or **Remove** for that device
-- The iOS device misses heartbeat pongs for more than 25 seconds
-- The network drops and does not recover
+```swift
+do {
+    for try await delta in client.chat(messages) {
+        output += delta
+    }
+} catch BigBroError.notPaired {
+    // call pair() first
+} catch BigBroError.networkError {
+    // connection dropped; check client.connectionState
+} catch {
+    // unexpected error
+}
+```
 
-While the network path is degraded (but not yet timed out), `connectionState` is `.reconnecting`. The UI can show a spinner during this window; the client recovers automatically if the path comes back in time.
+## Non-streaming mode
 
-## Tool calling
+When `streaming: false`, the stream yields exactly one value — the complete response — then finishes:
 
-When tools are passed to `send()`, the SDK runs a transparent agentic loop:
-
-1. Sends the request to the Mac
-2. Mac streams the response; if Ollama returns tool calls, the Mac forwards them to the iOS client
-3. iOS executes each tool handler locally and appends the results to the message history
-4. Re-sends the updated history to the Mac
-5. Repeats until Ollama returns a final text response with no tool calls
-6. Yields all text deltas to the caller's `AsyncThrowingStream`
-
-Callers never see tool calls — only the final streamed text.
+```swift
+var fullResponse = ""
+for try await chunk in client.chat(messages, streaming: false) {
+    fullResponse = chunk
+}
+```
 
 ## Source layout
 
 ```
 bigbro-kit/
 ├── Sources/
-│   ├── BigBroClient.swift      — main client (ObservableObject)
+│   ├── BigBroClient.swift      — main client (ObservableObject, agentic loop)
 │   ├── BigBroDevice.swift      — discovered device model
-│   ├── BonjourBrowser.swift    — Bonjour/mDNS discovery
-│   ├── Message.swift           — chat message model
-│   ├── OllamaOptions.swift     — generation options + format enum
-│   ├── PeerConnection.swift    — TCP actor (4-byte framed JSON)
+│   ├── BonjourBrowser.swift    — Bonjour/mDNS discovery (NetServiceBrowser)
+│   ├── Message.swift           — chat message model + wire serialization
+│   ├── OllamaOptions.swift     — generation options + OllamaFormat enum
+│   ├── PeerConnection.swift    — TCP actor (4-byte framed JSON, heartbeat)
 │   └── Tool.swift              — BigBroTool definition + handler
 └── Package.swift
 ```
+
+## Protocol overview
+
+BigBroKit communicates with the Mac over TCP on port 8765 using a simple framing protocol: each message is a 4-byte big-endian length prefix followed by a UTF-8 JSON body.
+
+| iOS → Mac | Fields | Purpose |
+|---|---|---|
+| `hello` | `deviceId`, `deviceName` | Initiate pairing |
+| `request` | `requestId`, `messages`, `streaming`, `tools?`, `model?`, ... | Chat inference |
+| `generateRequest` | `requestId`, `prompt`, `streaming`, `images?`, ... | Generate inference |
+| `ping` | — | Heartbeat (every 10s) |
+| `bye` | — | Clean disconnect |
+
+| Mac → iOS | Fields | Purpose |
+|---|---|---|
+| `helloAck` | `status` (`"approved"` / `"denied"`) | Pairing result |
+| `chunk` | `requestId`, `delta` | Streamed text token |
+| `toolCall` | `requestId`, `calls` | Tool calls array from Ollama |
+| `done` | `requestId` | Request complete |
+| `error` | `requestId`, `message` | Inference error |
+| `pong` | — | Heartbeat reply |
+| `bye` | — | Clean disconnect |
