@@ -6,8 +6,6 @@ actor PeerConnection {
     private var connectContinuation: CheckedContinuation<Void, Error>?
     private var helloAckContinuation: CheckedContinuation<Bool, Error>?
     private var msgContinuation: AsyncThrowingStream<[String: Any], Error>.Continuation?
-    private var lastPongReceived: Date = Date()
-    private var heartbeatTask: Task<Void, Never>?
 
     // MARK: - Public API
 
@@ -60,31 +58,9 @@ actor PeerConnection {
         try sendRaw(message)
     }
 
-    /// Start sending periodic pings. Call once after a successful handshake.
-    /// Tears down the connection if no pong is received within 25s.
-    func startHeartbeat() {
-        print("[PeerConnection] Starting heartbeat (10s interval, 25s timeout)")
-        lastPongReceived = Date()
-        heartbeatTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(10))
-                guard !Task.isCancelled, let self else { break }
-                let elapsed = await self.secondsSinceLastPong()
-                if elapsed > 25 {
-                    print("[PeerConnection] Heartbeat timeout (\(Int(elapsed))s since last pong), closing")
-                    await self.heartbeatTimeout()
-                    break
-                }
-                print("[PeerConnection] Heartbeat ping (last pong \(Int(elapsed))s ago)")
-                await self.sendPingIfAlive()
-            }
-        }
-    }
-
     func disconnect() {
         print("[PeerConnection] Disconnecting (sending bye)")
         try? sendRaw(["type": "bye"])
-        stopHeartbeat()
         connection?.cancel()
         connection = nil
     }
@@ -99,28 +75,6 @@ actor PeerConnection {
     }
 
     // MARK: - Private
-
-    private func secondsSinceLastPong() -> TimeInterval {
-        Date().timeIntervalSince(lastPongReceived)
-    }
-
-    private func sendPingIfAlive() {
-        guard connection != nil else { return }
-        try? sendRaw(["type": "ping"])
-    }
-
-    private func heartbeatTimeout() {
-        msgContinuation?.finish(throwing: BigBroError.networkError)
-        msgContinuation = nil
-        stopHeartbeat()
-        connection?.cancel()
-        connection = nil
-    }
-
-    private func stopHeartbeat() {
-        heartbeatTask?.cancel()
-        heartbeatTask = nil
-    }
 
     private func handleViability(_ isViable: Bool) {
         // Yield internal signal to BigBroClient for three-state UI
@@ -145,7 +99,6 @@ actor PeerConnection {
             connectContinuation = nil
         case .failed(let error):
             print("[PeerConnection] Connection failed: \(error)")
-            stopHeartbeat()
             connectContinuation?.resume(throwing: error)
             connectContinuation = nil
             helloAckContinuation?.resume(throwing: error)
@@ -154,7 +107,6 @@ actor PeerConnection {
             msgContinuation = nil
         case .cancelled:
             print("[PeerConnection] Connection cancelled")
-            stopHeartbeat()
             connectContinuation?.resume(throwing: BigBroError.networkError)
             connectContinuation = nil
             helloAckContinuation?.resume(returning: false)
@@ -198,12 +150,8 @@ actor PeerConnection {
             print("[PeerConnection] dispatch: helloAck approved=\(approved)")
             helloAckContinuation?.resume(returning: approved)
             helloAckContinuation = nil
-        } else if type == "pong" {
-            print("[PeerConnection] pong received")
-            lastPongReceived = Date()
         } else if type == "bye" {
             print("[PeerConnection] bye received, closing cleanly")
-            stopHeartbeat()
             msgContinuation?.finish()
             msgContinuation = nil
         } else {
