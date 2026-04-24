@@ -268,7 +268,12 @@ public final class BigBroClient: ObservableObject {
             do {
                 for try await msg in stream {
                     guard let self else { return }
-                    self.dispatch(msg)
+                    // Respond to Mac-side heartbeat pings before dispatching other messages
+                    if msg["type"] as? String == "ping" {
+                        try? await conn.send(["type": "pong"])
+                    } else {
+                        self.dispatch(msg)
+                    }
                 }
             } catch {
                 print("[BigBroClient] Message loop error: \(error)")
