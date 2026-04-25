@@ -4,7 +4,7 @@ import Network
 actor PeerConnection {
     private var connection: NWConnection?
     private var connectContinuation: CheckedContinuation<Void, Error>?
-    private var helloAckContinuation: CheckedContinuation<Bool, Error>?
+    private var helloAckContinuation: CheckedContinuation<(approved: Bool, missingModels: [String]), Error>?
     private var msgContinuation: AsyncThrowingStream<[String: Any], Error>.Continuation?
 
     // MARK: - Public API
@@ -37,17 +37,17 @@ actor PeerConnection {
         Task { await self.readLoop() }
     }
 
-    /// Send hello and wait for helloAck. Returns true if approved, false if denied.
-    func sendHello(deviceId: String, deviceName: String, requiredModels: [String] = []) async throws -> Bool {
-        print("[PeerConnection] Sending hello (deviceId=\(deviceId.prefix(8)), deviceName=\(deviceName))")
-        var msg: [String: Any] = ["type": "hello", "deviceId": deviceId, "deviceName": deviceName]
+    /// Send hello and wait for helloAck. Returns `(approved, missingModels)`.
+    func sendHello(deviceId: String, deviceName: String, appName: String, requiredModels: [String] = []) async throws -> (approved: Bool, missingModels: [String]) {
+        print("[PeerConnection] Sending hello (deviceId=\(deviceId.prefix(8)), deviceName=\(deviceName), appName=\(appName))")
+        var msg: [String: Any] = ["type": "hello", "deviceId": deviceId, "deviceName": deviceName, "appName": appName]
         if !requiredModels.isEmpty { msg["requiredModels"] = requiredModels }
         try sendRaw(msg)
         print("[PeerConnection] Hello sent, waiting for helloAck")
         let result = try await withCheckedThrowingContinuation { cont in
             self.helloAckContinuation = cont
         }
-        print("[PeerConnection] helloAck received: \(result ? "approved" : "denied")")
+        print("[PeerConnection] helloAck received: approved=\(result.approved) missing=\(result.missingModels)")
         return result
     }
 
@@ -111,7 +111,7 @@ actor PeerConnection {
             print("[PeerConnection] Connection cancelled")
             connectContinuation?.resume(throwing: BigBroError.networkError)
             connectContinuation = nil
-            helloAckContinuation?.resume(returning: false)
+            helloAckContinuation?.resume(returning: (approved: false, missingModels: []))
             helloAckContinuation = nil
             msgContinuation?.finish()
             msgContinuation = nil
@@ -149,8 +149,9 @@ actor PeerConnection {
         let type = msg["type"] as? String
         if type == "helloAck" {
             let approved = msg["status"] as? String == "approved"
-            print("[PeerConnection] dispatch: helloAck approved=\(approved)")
-            helloAckContinuation?.resume(returning: approved)
+            let missing = msg["missingModels"] as? [String] ?? []
+            print("[PeerConnection] dispatch: helloAck approved=\(approved) missing=\(missing)")
+            helloAckContinuation?.resume(returning: (approved: approved, missingModels: missing))
             helloAckContinuation = nil
         } else if type == "bye" {
             print("[PeerConnection] bye received, closing cleanly")

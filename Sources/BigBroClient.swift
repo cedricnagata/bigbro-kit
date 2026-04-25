@@ -35,6 +35,7 @@ private final class RequestHolder: @unchecked Sendable {
 public final class BigBroClient: ObservableObject {
     @Published public private(set) var connectedDevice: BigBroDevice?
     @Published public private(set) var connectionState: ConnectionState = .disconnected
+    @Published public private(set) var missingModels: [String] = []
 
     /// Convenience accessor; true only when fully connected (not reconnecting).
     public var isConnected: Bool { connectionState == .connected }
@@ -44,10 +45,12 @@ public final class BigBroClient: ObservableObject {
     private var messageTask: Task<Void, Never>?
     private let activeRequest = RequestHolder()
     private let requiredModels: [String]
+    private let appName: String
 
-    public init(requiredModels: [String] = []) {
+    public init(appName: String, requiredModels: [String] = []) {
+        self.appName = appName
         self.requiredModels = requiredModels
-        print("[BigBroClient] Initialized with \(requiredModels.count) required model(s)")
+        print("[BigBroClient] Initialized app='\(appName)' with \(requiredModels.count) required model(s)")
     }
 
     // MARK: - Public API
@@ -64,16 +67,17 @@ public final class BigBroClient: ObservableObject {
         let conn = PeerConnection()
         try await conn.connect(host: device.host, port: UInt16(device.port))
         print("[BigBroClient] TCP connected, sending hello")
-        let approved = try await conn.sendHello(deviceId: deviceId(), deviceName: UIDevice.current.name, requiredModels: requiredModels)
-        print("[BigBroClient] pair result: \(approved ? "approved" : "denied")")
-        if approved {
+        let ack = try await conn.sendHello(deviceId: deviceId(), deviceName: UIDevice.current.name, appName: appName, requiredModels: requiredModels)
+        print("[BigBroClient] pair result: approved=\(ack.approved) missing=\(ack.missingModels)")
+        if ack.approved {
             peerConnection = conn
             connectedDevice = device
             connectionState = .connected
+            missingModels = ack.missingModels
             startMessageLoop(conn: conn)
             print("[BigBroClient] Paired")
         }
-        return approved
+        return ack.approved
     }
 
     /// Send a chat request to the paired Mac, proxied to Ollama's `/api/chat`.
@@ -306,6 +310,9 @@ public final class BigBroClient: ObservableObject {
         case "done":
             activeRequest.continuation?.finish()
             activeRequest.continuation = nil
+        case "modelsUpdate":
+            missingModels = msg["missingModels"] as? [String] ?? []
+            print("[BigBroClient] modelsUpdate: missing=\(missingModels)")
         case "error":
             let errMsg = msg["message"] as? String ?? "unknown"
             print("[BigBroClient] Server error: \(errMsg)")
@@ -320,10 +327,14 @@ public final class BigBroClient: ObservableObject {
         print("[BigBroClient] teardown: connectionState → .disconnected")
         connectionState = .disconnected
         connectedDevice = nil
+        missingModels = []
         peerConnection = nil
     }
 
     private func deviceId() -> String {
-        UIDevice.current.identifierForVendor?.uuidString ?? UUID().uuidString
+        let vendor = UIDevice.current.identifierForVendor?.uuidString ?? "unknown"
+        let bundle = Bundle.main.bundleIdentifier ?? "unknown"
+        // Combine vendor + bundle so two apps on the same device get distinct IDs
+        return "\(vendor).\(bundle)"
     }
 }
