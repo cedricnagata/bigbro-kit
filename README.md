@@ -40,7 +40,7 @@ Add the following to your app's `Info.plist`:
 ```swift
 import BigBroKit
 
-let client = BigBroClient()
+let client = BigBroClient(appName: "My App")
 
 // 1. Discover BigBro Macs on the local network (5-second scan)
 let devices = await client.discover()
@@ -50,7 +50,12 @@ guard !devices.isEmpty else { return }
 let approved = try await client.pair(with: devices[0])
 guard approved else { return }
 
-// 3. Stream a chat response one token at a time
+// 3. Check for missing models
+if !client.missingModels.isEmpty {
+    print("Missing: \(client.missingModels.joined(separator: ", "))")
+}
+
+// 4. Stream a chat response one token at a time
 for try await delta in client.chat([.user("Explain Swift concurrency in one paragraph.")]) {
     print(delta, terminator: "")
 }
@@ -68,16 +73,13 @@ for try await delta in client.chat([.user("Explain Swift concurrency in one para
 The client tears down automatically — returning `connectionState` to `.disconnected` — when any of these happens:
 
 - The Mac user clicks **Disconnect** or **Remove** for that device
-- No heartbeat pong is received for more than 25 seconds
-- The network drops and does not recover within the heartbeat window
+- The underlying TCP connection fails or is reset
 
-While the path is degraded but not yet timed out, `connectionState` is `.reconnecting`. The client recovers automatically if the connection comes back in time.
-
-Observe state changes in SwiftUI with `@ObservedObject` or `@StateObject`:
+Observe state changes in SwiftUI with `@ObservedObject`:
 
 ```swift
 struct ContentView: View {
-    @StateObject private var client = BigBroClient()
+    @ObservedObject var client: BigBroClient
 
     var body: some View {
         switch client.connectionState {
@@ -88,6 +90,24 @@ struct ContentView: View {
     }
 }
 ```
+
+## Required models
+
+Declare the Ollama models your app needs when creating the client. BigBro checks whether they are installed when the device connects and reports any that are missing:
+
+```swift
+let client = BigBroClient(
+    appName: "My App",
+    requiredModels: ["llama3.2", "llava:13b"]
+)
+
+// After pair():
+if !client.missingModels.isEmpty {
+    // Show a warning — these models need to be downloaded in Ollama on the Mac
+}
+```
+
+`missingModels` is a `@Published` property. If Ollama's model list changes while the device is connected (e.g. a model is downloaded), the Mac automatically pushes an update and `missingModels` updates in real time — no reconnect needed.
 
 ## API reference
 
@@ -100,13 +120,23 @@ struct ContentView: View {
 ```swift
 @Published var connectedDevice: BigBroDevice?
 @Published var connectionState: ConnectionState   // .disconnected | .reconnecting | .connected
+@Published var missingModels: [String]            // models not yet installed in Ollama on the Mac
 var isConnected: Bool                             // true only when fully .connected
 ```
+
+#### Initializer
+
+```swift
+public init(appName: String, requiredModels: [String] = [])
+```
+
+`appName` is displayed on the Mac's device list alongside the device name (e.g. "iPhone • My App"), making it easy to distinguish multiple apps from the same device.
 
 #### Discovery and pairing
 
 ```swift
 // Scans the local network for BigBro Macs. Times out after ~5 seconds.
+// Multiple concurrent calls join the same in-flight scan.
 func discover() async -> [BigBroDevice]
 
 // Connects and performs the hello/helloAck handshake.
@@ -114,14 +144,14 @@ func discover() async -> [BigBroDevice]
 // Throws on network failure.
 func pair(with device: BigBroDevice) async throws -> Bool
 
-// Sends bye, stops the heartbeat, and tears down the connection.
+// Sends bye and tears down the connection.
 func disconnect()
 ```
 
 #### Inference — `/api/chat`
 
 ```swift
-func send(
+func chat(
     _ messages: [Message],
     model: String? = nil,         // overrides the Mac's default model
     streaming: Bool = true,       // false → single yield of the full response
@@ -138,14 +168,14 @@ func send(
 ```swift
 func generate(
     prompt: String,
-    images: [Data] = [],          // multimodal models only; pass raw Data, base64 is handled internally
+    images: [Data] = [],          // multimodal models only; base64 is handled internally
     suffix: String? = nil,
     system: String? = nil,
     template: String? = nil,
     model: String? = nil,
     format: OllamaFormat? = nil,
     options: OllamaOptions? = nil,
-    raw: Bool? = nil,             // skip prompt formatting
+    raw: Bool? = nil,
     think: Bool? = nil,
     keepAlive: String? = nil,
     streaming: Bool = true
@@ -185,7 +215,7 @@ public struct Message {
 
 ### `BigBroTool`
 
-Tools are defined with a JSON-schema description and a Swift `async` handler that runs locally on the iOS device. Pass one or more to `send()` and the SDK's agentic loop handles tool execution transparently — callers only see the final text stream.
+Tools are defined with a JSON-schema description and a Swift `async` handler that runs locally on the iOS device. Pass one or more to `chat()` and the SDK's agentic loop handles tool execution transparently — callers only see the final text stream.
 
 ```swift
 // Tool with no parameters
@@ -291,8 +321,8 @@ public struct BigBroDevice: Identifiable, Hashable {
 
 ```swift
 public enum BigBroError: LocalizedError {
-    case notPaired      // send() or generate() called before a successful pair()
-    case networkError   // TCP failure or heartbeat timeout
+    case notPaired      // chat() or generate() called before a successful pair()
+    case networkError   // TCP failure
 }
 ```
 
@@ -342,32 +372,31 @@ bigbro-kit/
 ├── Sources/
 │   ├── BigBroClient.swift      — main client (ObservableObject, agentic loop)
 │   ├── BigBroDevice.swift      — discovered device model
-│   ├── BonjourBrowser.swift    — Bonjour/mDNS discovery (NetServiceBrowser)
+│   ├── BonjourBrowser.swift    — Bonjour/mDNS discovery (NetServiceBrowser, MainActor)
 │   ├── Message.swift           — chat message model + wire serialization
 │   ├── OllamaOptions.swift     — generation options + OllamaFormat enum
-│   ├── PeerConnection.swift    — TCP actor (4-byte framed JSON, heartbeat)
+│   ├── PeerConnection.swift    — TCP actor (4-byte framed JSON)
 │   └── Tool.swift              — BigBroTool definition + handler
 └── Package.swift
 ```
 
 ## Protocol overview
 
-BigBroKit communicates with the Mac over TCP on port 8765 using a simple framing protocol: each message is a 4-byte big-endian length prefix followed by a UTF-8 JSON body.
+BigBroKit communicates with the Mac over TCP on port 8765. Each message is a 4-byte big-endian length prefix followed by a UTF-8 JSON body.
 
 | iOS → Mac | Fields | Purpose |
 |---|---|---|
-| `hello` | `deviceId`, `deviceName` | Initiate pairing |
-| `request` | `requestId`, `messages`, `streaming`, `tools?`, `model?`, ... | Chat inference |
-| `generateRequest` | `requestId`, `prompt`, `streaming`, `images?`, ... | Generate inference |
-| `ping` | — | Heartbeat (every 10s) |
+| `hello` | `deviceId`, `deviceName`, `appName`, `requiredModels?` | Initiate pairing |
+| `request` | `requestId`, `messages`, `streaming`, `tools?`, `model?`, … | Chat inference |
+| `generateRequest` | `requestId`, `prompt`, `streaming`, `images?`, … | Generate inference |
 | `bye` | — | Clean disconnect |
 
 | Mac → iOS | Fields | Purpose |
 |---|---|---|
-| `helloAck` | `status` (`"approved"` / `"denied"`) | Pairing result |
+| `helloAck` | `status`, `missingModels?` | Pairing result |
 | `chunk` | `requestId`, `delta` | Streamed text token |
 | `toolCall` | `requestId`, `calls` | Tool calls array from Ollama |
 | `done` | `requestId` | Request complete |
 | `error` | `requestId`, `message` | Inference error |
-| `pong` | — | Heartbeat reply |
+| `modelsUpdate` | `missingModels` | Live push when Ollama model list changes |
 | `bye` | — | Clean disconnect |
