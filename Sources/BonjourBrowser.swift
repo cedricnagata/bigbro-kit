@@ -1,28 +1,36 @@
 import Foundation
 
-final class BonjourBrowser: NSObject, @unchecked Sendable {
+@MainActor
+final class BonjourBrowser: NSObject {
     private var browser: NetServiceBrowser?
     private var pendingServices: [NetService] = []
     private var resolvedDevices: [BigBroDevice] = []
-    private var continuation: CheckedContinuation<[BigBroDevice], Never>?
+    private var waiters: [CheckedContinuation<[BigBroDevice], Never>] = []
     private var timeoutTask: Task<Void, Never>?
+    private var isDiscovering = false
 
     func discover(timeout: TimeInterval = 5.0) async -> [BigBroDevice] {
-        resolvedDevices = []
-        pendingServices = []
-        print("[BonjourBrowser] Starting search for _bigbro._tcp.")
-
         return await withCheckedContinuation { continuation in
-            self.continuation = continuation
+            waiters.append(continuation)
 
-            DispatchQueue.main.async {
-                let browser = NetServiceBrowser()
-                browser.delegate = self
-                browser.searchForServices(ofType: "_bigbro._tcp.", inDomain: "local.")
-                self.browser = browser
+            // If a discovery is already running, just join it — both callers will
+            // receive the same result when it finishes.
+            if isDiscovering {
+                print("[BonjourBrowser] Joining in-flight discovery (\(waiters.count) waiter(s))")
+                return
             }
 
-            self.timeoutTask = Task {
+            isDiscovering = true
+            resolvedDevices = []
+            pendingServices = []
+            print("[BonjourBrowser] Starting search for _bigbro._tcp.")
+
+            let browser = NetServiceBrowser()
+            browser.delegate = self
+            browser.searchForServices(ofType: "_bigbro._tcp.", inDomain: "local.")
+            self.browser = browser
+
+            self.timeoutTask = Task { @MainActor in
                 try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
                 self.finish()
             }
@@ -30,16 +38,29 @@ final class BonjourBrowser: NSObject, @unchecked Sendable {
     }
 
     private func finish() {
-        guard let continuation else { return }
-        self.continuation = nil
+        guard isDiscovering else { return }
+        isDiscovering = false
         timeoutTask?.cancel()
         timeoutTask = nil
-        DispatchQueue.main.async {
-            self.browser?.stop()
-            self.browser = nil
+
+        // Clear delegates so any in-flight Bonjour callbacks don't bleed into a
+        // subsequent discovery, then stop.
+        browser?.delegate = nil
+        browser?.stop()
+        browser = nil
+        for service in pendingServices {
+            service.delegate = nil
+            service.stop()
         }
-        print("[BonjourBrowser] Discovery finished, found \(resolvedDevices.count) device(s): \(resolvedDevices.map { "\($0.name) \($0.host):\($0.port)" })")
-        continuation.resume(returning: resolvedDevices)
+        pendingServices = []
+
+        let result = resolvedDevices
+        let toResume = waiters
+        waiters = []
+        print("[BonjourBrowser] Discovery finished, found \(result.count) device(s) — resuming \(toResume.count) caller(s)")
+        for waiter in toResume {
+            waiter.resume(returning: result)
+        }
     }
 }
 
@@ -68,7 +89,9 @@ extension BonjourBrowser: NetServiceDelegate {
             return
         }
         let device = BigBroDevice(id: sender.name, name: sender.name, host: hostName, port: sender.port)
-        resolvedDevices.append(device)
+        if !resolvedDevices.contains(where: { $0.id == device.id }) {
+            resolvedDevices.append(device)
+        }
         pendingServices.removeAll { $0 === sender }
     }
 
