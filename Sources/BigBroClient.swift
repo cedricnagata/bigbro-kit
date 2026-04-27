@@ -36,21 +36,32 @@ public final class BigBroClient: ObservableObject {
     @Published public private(set) var connectedDevice: BigBroDevice?
     @Published public private(set) var connectionState: ConnectionState = .disconnected
     @Published public private(set) var missingModels: [String] = []
+    /// Bonjour service names of Macs the user has previously paired with.
+    @Published public private(set) var pairedDeviceNames: Set<String> = []
+    /// Whether auto-reconnect is currently active.
+    @Published public private(set) var autoReconnectEnabled: Bool = false
 
     /// Convenience accessor; true only when fully connected (not reconnecting).
     public var isConnected: Bool { connectionState == .connected }
 
     private let browser = BonjourBrowser()
+    private let continuousBrowser = ContinuousBonjourBrowser()
+    private let pairedStore = PairedDeviceStore()
     private var peerConnection: PeerConnection?
     private var messageTask: Task<Void, Never>?
+    private var autoReconnectTask: Task<Void, Never>?
+    private var pendingPairTask: Task<Void, Never>?
     private let activeRequest = RequestHolder()
     private let requiredModels: [String]
     private let appName: String
+    private var didRegisterLifecycleObservers = false
 
     public init(appName: String, requiredModels: [String] = []) {
         self.appName = appName
         self.requiredModels = requiredModels
-        print("[BigBroClient] Initialized app='\(appName)' with \(requiredModels.count) required model(s)")
+        self.pairedDeviceNames = pairedStore.ids()
+        print("[BigBroClient] Initialized app='\(appName)' with \(requiredModels.count) required model(s), \(pairedDeviceNames.count) paired Mac(s)")
+        registerLifecycleObserversIfNeeded()
     }
 
     // MARK: - Public API
@@ -63,6 +74,13 @@ public final class BigBroClient: ObservableObject {
     }
 
     public func pair(with device: BigBroDevice) async throws -> Bool {
+        // Manual pair wins over any in-flight auto-pair attempt.
+        pendingPairTask?.cancel()
+        pendingPairTask = nil
+        return try await pairInternal(with: device)
+    }
+
+    private func pairInternal(with device: BigBroDevice) async throws -> Bool {
         print("[BigBroClient] Pairing with \(device.name) at \(device.host):\(device.port)")
         let conn = PeerConnection()
         try await conn.connect(host: device.host, port: UInt16(device.port))
@@ -75,9 +93,57 @@ public final class BigBroClient: ObservableObject {
             connectionState = .connected
             missingModels = ack.missingModels
             startMessageLoop(conn: conn)
+            rememberDevice(device)
             print("[BigBroClient] Paired")
+        } else {
+            await conn.disconnect()
         }
         return ack.approved
+    }
+
+    // MARK: - Auto-reconnect
+
+    /// Start watching for any previously-paired Mac and automatically pair when
+    /// one appears. Safe to call repeatedly. Persists the enabled flag so the
+    /// SDK resumes auto-reconnect on next launch.
+    public func enableAutoReconnect() {
+        guard !autoReconnectEnabled else { return }
+        autoReconnectEnabled = true
+        pairedStore.autoReconnectEnabled = true
+        print("[BigBroClient] enableAutoReconnect (paired count=\(pairedDeviceNames.count))")
+        startAutoReconnectLoop()
+    }
+
+    public func disableAutoReconnect() {
+        guard autoReconnectEnabled else { return }
+        autoReconnectEnabled = false
+        pairedStore.autoReconnectEnabled = false
+        print("[BigBroClient] disableAutoReconnect")
+        autoReconnectTask?.cancel()
+        autoReconnectTask = nil
+        pendingPairTask?.cancel()
+        pendingPairTask = nil
+        continuousBrowser.stop()
+    }
+
+    public func forgetDevice(_ name: String) {
+        pairedStore.remove(name)
+        pairedDeviceNames = pairedStore.ids()
+        print("[BigBroClient] forgetDevice: \(name) (remaining=\(pairedDeviceNames.count))")
+    }
+
+    public func forgetAllDevices() {
+        pairedStore.removeAll()
+        pairedDeviceNames = []
+        print("[BigBroClient] forgetAllDevices")
+    }
+
+    /// Resumes auto-reconnect if it was previously enabled. Apps that opt in
+    /// once should call this on launch to restore the behavior.
+    public func resumeAutoReconnectIfEnabled() {
+        if pairedStore.autoReconnectEnabled && !autoReconnectEnabled {
+            enableAutoReconnect()
+        }
     }
 
     /// Send a chat request to the paired Mac, proxied to Ollama's `/api/chat`.
@@ -329,6 +395,91 @@ public final class BigBroClient: ObservableObject {
         connectedDevice = nil
         missingModels = []
         peerConnection = nil
+        if autoReconnectEnabled {
+            // Re-arm the browse so currently-visible Macs trigger a fresh
+            // `.appeared` event and we attempt to reconnect immediately.
+            print("[BigBroClient] teardown: re-arming auto-reconnect browse")
+            startAutoReconnectLoop()
+        }
+    }
+
+    private func rememberDevice(_ device: BigBroDevice) {
+        pairedStore.add(id: device.id, name: device.name)
+        pairedDeviceNames = pairedStore.ids()
+        print("[BigBroClient] Remembered \(device.name) (total=\(pairedDeviceNames.count))")
+    }
+
+    private func startAutoReconnectLoop() {
+        autoReconnectTask?.cancel()
+        let stream = continuousBrowser.start()
+        autoReconnectTask = Task { @MainActor [weak self] in
+            print("[BigBroClient] Auto-reconnect loop started")
+            for await event in stream {
+                guard let self else { return }
+                if Task.isCancelled { break }
+                switch event {
+                case .appeared(let device):
+                    self.handleDeviceAppeared(device)
+                case .disappeared:
+                    break
+                }
+            }
+            print("[BigBroClient] Auto-reconnect loop ended")
+        }
+    }
+
+    private func handleDeviceAppeared(_ device: BigBroDevice) {
+        guard autoReconnectEnabled else { return }
+        guard peerConnection == nil else { return }
+        guard pendingPairTask == nil else { return }
+        guard pairedStore.contains(device.id) else {
+            print("[BigBroClient] Auto-reconnect: ignoring unknown \(device.name)")
+            return
+        }
+        print("[BigBroClient] Auto-reconnect: attempting \(device.name)")
+        pendingPairTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.pendingPairTask = nil }
+            do {
+                _ = try await self.pairInternal(with: device)
+            } catch {
+                print("[BigBroClient] Auto-reconnect: pair failed for \(device.name): \(error)")
+            }
+        }
+    }
+
+    private func registerLifecycleObserversIfNeeded() {
+        guard !didRegisterLifecycleObservers else { return }
+        didRegisterLifecycleObservers = true
+        let nc = NotificationCenter.default
+        nc.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.handleEnteredBackground() }
+        }
+        nc.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.handleEnteringForeground() }
+        }
+    }
+
+    private func handleEnteredBackground() {
+        guard autoReconnectEnabled else { return }
+        print("[BigBroClient] App backgrounded — pausing auto-reconnect browse")
+        autoReconnectTask?.cancel()
+        autoReconnectTask = nil
+        continuousBrowser.stop()
+    }
+
+    private func handleEnteringForeground() {
+        guard autoReconnectEnabled, autoReconnectTask == nil else { return }
+        print("[BigBroClient] App foregrounding — resuming auto-reconnect browse")
+        startAutoReconnectLoop()
     }
 
     private func deviceId() -> String {
