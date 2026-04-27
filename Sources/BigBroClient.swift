@@ -4,11 +4,18 @@ import UIKit
 public enum BigBroError: Error, LocalizedError {
     case notPaired
     case networkError
+    /// The Mac doesn't have the requested model installed and is downloading
+    /// it. Watch `BigBroClient.modelDownloads` for progress.
+    case modelDownloading(model: String, alreadyInProgress: Bool)
 
     public var errorDescription: String? {
         switch self {
         case .notPaired: return "Not paired with a BigBro device."
         case .networkError: return "Network error."
+        case .modelDownloading(let model, let alreadyInProgress):
+            return alreadyInProgress
+                ? "Model '\(model)' is still downloading on the Mac."
+                : "Model '\(model)' is not downloaded — started downloading on the Mac."
         }
     }
 }
@@ -36,6 +43,10 @@ public final class BigBroClient: ObservableObject {
     @Published public private(set) var connectedDevice: BigBroDevice?
     @Published public private(set) var connectionState: ConnectionState = .disconnected
     @Published public private(set) var missingModels: [String] = []
+    /// Live download progress for any model the Mac is pulling. Updated
+    /// continuously while pulls are active; entries are removed shortly after
+    /// completion.
+    @Published public private(set) var modelDownloads: [String: ModelDownloadProgress] = [:]
     /// Bonjour service names of Macs the user has previously paired with.
     @Published public private(set) var pairedDeviceNames: Set<String> = []
     /// Whether auto-reconnect is currently active.
@@ -379,6 +390,17 @@ public final class BigBroClient: ObservableObject {
         case "modelsUpdate":
             missingModels = msg["missingModels"] as? [String] ?? []
             print("[BigBroClient] modelsUpdate: missing=\(missingModels)")
+        case "modelDownloading":
+            // Active request is blocked — model needs to be pulled first.
+            let model = msg["model"] as? String ?? ""
+            let already = msg["alreadyInProgress"] as? Bool ?? false
+            print("[BigBroClient] modelDownloading: \(model) alreadyInProgress=\(already)")
+            activeRequest.continuation?.finish(throwing: BigBroError.modelDownloading(model: model, alreadyInProgress: already))
+            activeRequest.continuation = nil
+        case "modelDownloadProgress":
+            applyDownloadProgress(msg, done: false)
+        case "modelDownloadComplete":
+            applyDownloadProgress(msg, done: true)
         case "error":
             let errMsg = msg["message"] as? String ?? "unknown"
             print("[BigBroClient] Server error: \(errMsg)")
@@ -386,6 +408,34 @@ public final class BigBroClient: ObservableObject {
             activeRequest.continuation = nil
         default:
             print("[BigBroClient] dispatch: unhandled type '\(type)'")
+        }
+    }
+
+    private func applyDownloadProgress(_ msg: [String: Any], done: Bool) {
+        guard let model = msg["model"] as? String else { return }
+        let status = msg["status"] as? String ?? ""
+        let completed = (msg["completed"] as? Int64) ?? Int64((msg["completed"] as? Int) ?? 0)
+        let total = (msg["total"] as? Int64) ?? Int64((msg["total"] as? Int) ?? 0)
+        let success = (msg["success"] as? Bool) ?? !done
+        let error = msg["error"] as? String
+        let progress = ModelDownloadProgress(
+            model: model,
+            status: status,
+            bytesCompleted: completed,
+            bytesTotal: total,
+            done: done,
+            success: success,
+            error: error
+        )
+        modelDownloads[model] = progress
+        if done {
+            // Drop completed entries shortly after, mirroring the Mac side.
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(2))
+                if self?.modelDownloads[model]?.done == true {
+                    self?.modelDownloads.removeValue(forKey: model)
+                }
+            }
         }
     }
 
