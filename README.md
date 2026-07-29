@@ -222,9 +222,24 @@ func converse(
 ) -> AsyncThrowingStream<ConverseEvent, Error>
 ```
 
-`speak()` yields raw audio chunks. The default `pcm` is 24 kHz 16-bit signed little-endian
-mono with no header — append the chunks in order and feed them to `AVAudioPlayerNode`.
+`speak()` yields raw audio chunks. The default `pcm` is 24 kHz 16-bit signed little-endian mono
+with no header, so it cannot be handed to `AVAudioPlayer` — use `BigBroAudioPlayer` below.
 Speaking a canned string costs no LLM call.
+
+#### `BigBroAudioPlayer`
+
+```swift
+let player = BigBroAudioPlayer()
+try await player.play(client.speak("Dinner is ready."))
+```
+
+Converts each chunk to Float32 and schedules it on an `AVAudioPlayerNode` as it arrives, so
+playback begins on the first chunk rather than after the whole utterance. `play()` returns once
+the last buffer has finished; `stop()` ends playback immediately for barge-in and leaves the
+engine running so the next utterance starts without restart latency.
+
+Pass `configuresAudioSession: false` if your app already manages `AVAudioSession` itself —
+otherwise the two fight over the category — and call `shutdown()` before deactivating the session.
 
 `transcribe()` is batch, not streaming: record a complete turn, then send it. Uploads are
 capped at 10 MB. Your app needs `NSMicrophoneUsageDescription` to record.
