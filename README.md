@@ -1,6 +1,8 @@
 # BigBroKit
 
-An iOS Swift Package for connecting to a [BigBro](https://github.com/nagata-inc/bigbro) Mac and running LLM inference over the local network. BigBroKit discovers the Mac via Bonjour, establishes a persistent TCP connection, and proxies requests to the Mac's local [Ollama](https://ollama.ai) instance — covering both `/api/chat` (with full tool-calling support) and `/api/generate`.
+An iOS Swift Package for connecting to a [BigBro](https://github.com/nagata-inc/bigbro) Mac and running inference over the local network. BigBroKit discovers the Mac via Bonjour, establishes a persistent TCP connection, and proxies requests to the Mac's local backend.
+
+The Mac talks to an OpenAI-compatible server — [Ollama](https://ollama.ai) by default for chat, [LocalAI](https://localai.io) for speech — so this package covers chat with full tool calling, single-turn generation, text-to-speech and transcription.
 
 ## Requirements
 
@@ -148,7 +150,7 @@ func pair(with device: BigBroDevice) async throws -> Bool
 func disconnect()
 ```
 
-#### Inference — `/api/chat`
+#### Inference — chat
 
 ```swift
 func chat(
@@ -156,14 +158,14 @@ func chat(
     model: String? = nil,         // overrides the Mac's default model
     streaming: Bool = true,       // false → single yield of the full response
     tools: [BigBroTool] = [],     // triggers the agentic tool-call loop
-    format: OllamaFormat? = nil,
-    options: OllamaOptions? = nil,
+    format: ResponseFormat? = nil,
+    options: GenerationOptions? = nil,
     think: Bool? = nil,           // chain-of-thought (supported models only)
     keepAlive: String? = nil      // how long Ollama keeps the model loaded
 ) -> AsyncThrowingStream<String, Error>
 ```
 
-#### Inference — `/api/generate`
+#### Inference — generate
 
 ```swift
 func generate(
@@ -173,8 +175,8 @@ func generate(
     system: String? = nil,
     template: String? = nil,
     model: String? = nil,
-    format: OllamaFormat? = nil,
-    options: OllamaOptions? = nil,
+    format: ResponseFormat? = nil,
+    options: GenerationOptions? = nil,
     raw: Bool? = nil,
     think: Bool? = nil,
     keepAlive: String? = nil,
@@ -182,7 +184,83 @@ func generate(
 ) -> AsyncThrowingStream<String, Error>
 ```
 
-`generate()` does not support tools — `/api/generate` is a raw completion endpoint.
+`generate()` does not support tools — it is a single-turn completion.
+
+> The Mac proxies to an OpenAI-compatible backend, so `template`, `raw` and `suffix` have no
+> equivalent and return an error rather than being silently ignored. `think` is translated to
+> `reasoning_effort`, and reasoning arrives as a separate `thinking` message so it is never
+> mixed into the answer — or spoken.
+
+---
+
+#### Speech — `speak()`, `transcribe()`, `converse()`
+
+Requires a speech backend enabled on the Mac (LocalAI by default; Speaches works too).
+
+```swift
+func speak(
+    _ text: String,
+    voice: String? = nil,
+    model: String? = nil,
+    responseFormat: String? = nil,   // "pcm" (default), "wav", "mp3", "opus", "flac"
+    speed: Double? = nil
+) -> AsyncThrowingStream<Data, Error>
+
+func transcribe(
+    _ audio: Data,
+    format: String = "wav",
+    model: String? = nil,
+    language: String? = nil
+) async throws -> String
+
+func converse(
+    _ messages: [Message],
+    voice: String? = nil,
+    tools: [BigBroTool] = [],
+    model: String? = nil,
+    options: GenerationOptions? = nil
+) -> AsyncThrowingStream<ConverseEvent, Error>
+```
+
+`speak()` yields raw audio chunks. The default `pcm` is 24 kHz 16-bit signed little-endian mono
+with no header, so it cannot be handed to `AVAudioPlayer` — use `BigBroAudioPlayer` below.
+Speaking a canned string costs no LLM call.
+
+#### `BigBroAudioPlayer`
+
+```swift
+let player = BigBroAudioPlayer()
+try await player.play(client.speak("Dinner is ready."))
+```
+
+Converts each chunk to Float32 and schedules it on an `AVAudioPlayerNode` as it arrives, so
+playback begins on the first chunk rather than after the whole utterance. `play()` returns once
+the last buffer has finished; `stop()` ends playback immediately for barge-in and leaves the
+engine running so the next utterance starts without restart latency.
+
+Pass `configuresAudioSession: false` if your app already manages `AVAudioSession` itself —
+otherwise the two fight over the category — and call `shutdown()` before deactivating the session.
+
+`transcribe()` is batch, not streaming: record a complete turn, then send it. Uploads are
+capped at 10 MB. Your app needs `NSMicrophoneUsageDescription` to record.
+
+`converse()` runs a chat turn and speaks the answer as it arrives, one sentence at a time,
+so time to first audio is a single sentence rather than a whole generation:
+
+```swift
+for try await event in client.converse([.user("What's the weather like?")], voice: "af_heart") {
+    switch event {
+    case .text(let delta):  transcript += delta
+    case .audio(let chunk): player.enqueue(chunk)
+    }
+}
+```
+
+Sentences are segmented with `NLTokenizer` and stripped of markdown — code fences, link
+targets and table pipes are noise read aloud. Speech requests are serialized, so audio can
+never arrive out of order. The tool-calling loop still runs on the device, which is why
+`converse()` is a composition over `chat()` and `speak()` rather than a Mac-side mode: only
+the client knows which turn is a final answer and which is an intermediate tool step.
 
 ---
 
@@ -262,12 +340,12 @@ The caller never sees intermediate tool calls — only the final streamed text.
 
 ---
 
-### `OllamaOptions`
+### `GenerationOptions`
 
 Maps directly to Ollama's `options` request field. All fields are optional.
 
 ```swift
-let opts = OllamaOptions(temperature: 0.7, topK: 40, seed: 42)
+let opts = GenerationOptions(temperature: 0.7, topK: 40, seed: 42)
 for try await delta in client.chat(messages, options: opts) { ... }
 ```
 
@@ -287,7 +365,7 @@ for try await delta in client.chat(messages, options: opts) { ... }
 
 ---
 
-### `OllamaFormat`
+### `ResponseFormat`
 
 ```swift
 // Plain JSON mode
@@ -321,8 +399,10 @@ public struct BigBroDevice: Identifiable, Hashable {
 
 ```swift
 public enum BigBroError: LocalizedError {
-    case notPaired      // chat() or generate() called before a successful pair()
-    case networkError   // TCP failure
+    case notPaired            // a request was made before a successful pair()
+    case networkError         // TCP failure
+    case serverError(String)  // the Mac reported a failure; the message is actionable
+    case modelDownloading(model: String, alreadyInProgress: Bool)
 }
 ```
 
@@ -374,7 +454,7 @@ bigbro-kit/
 │   ├── BigBroDevice.swift      — discovered device model
 │   ├── BonjourBrowser.swift    — Bonjour/mDNS discovery (NetServiceBrowser, MainActor)
 │   ├── Message.swift           — chat message model + wire serialization
-│   ├── OllamaOptions.swift     — generation options + OllamaFormat enum
+│   ├── GenerationOptions.swift — generation options + ResponseFormat enum
 │   ├── PeerConnection.swift    — TCP actor (4-byte framed JSON)
 │   └── Tool.swift              — BigBroTool definition + handler
 └── Package.swift
@@ -389,14 +469,23 @@ BigBroKit communicates with the Mac over TCP on port 8765. Each message is a 4-b
 | `hello` | `deviceId`, `deviceName`, `appName`, `requiredModels?` | Initiate pairing |
 | `request` | `requestId`, `messages`, `streaming`, `tools?`, `model?`, … | Chat inference |
 | `generateRequest` | `requestId`, `prompt`, `streaming`, `images?`, … | Generate inference |
+| `speechRequest` | `requestId`, `input`, `voice?`, `model?`, `response_format?`, `speed?` | Text to speech |
+| `transcribeRequest` | `requestId`, `audio` (base64), `audioFormat?`, `model?`, `language?` | Speech to text |
 | `bye` | — | Clean disconnect |
 
 | Mac → iOS | Fields | Purpose |
 |---|---|---|
 | `helloAck` | `status`, `missingModels?` | Pairing result |
 | `chunk` | `requestId`, `delta` | Streamed text token |
-| `toolCall` | `requestId`, `calls` | Tool calls array from Ollama |
+| `thinking` | `requestId`, `delta` | Reasoning token, never mixed into `chunk` |
+| `toolCall` | `requestId`, `calls` | Tool calls array |
+| `audioStart` | `requestId`, `format`, `sampleRate`, `channels`, `model`, `voice` | Precedes audio so playback can be configured |
+| `audioChunk` | `requestId`, `audio` (base64), `seq` | Synthesized audio |
+| `transcript` | `requestId`, `text`, `language?` | Transcription result |
 | `done` | `requestId` | Request complete |
 | `error` | `requestId`, `message` | Inference error |
+
+Every response carries a `requestId` and the client routes on it, so chat, speech and
+transcription can be in flight simultaneously — which `converse()` relies on.
 | `modelsUpdate` | `missingModels` | Live push when Ollama model list changes |
 | `bye` | — | Clean disconnect |
