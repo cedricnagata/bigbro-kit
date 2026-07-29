@@ -4,6 +4,9 @@ import UIKit
 public enum BigBroError: Error, LocalizedError {
     case notPaired
     case networkError
+    /// The Mac reported a failure for this request. The message comes from the Mac and is
+    /// meant to be actionable — a missing model, a speech backend that isn't running.
+    case serverError(String)
     /// The Mac doesn't have the requested model installed and is downloading
     /// it. Watch `BigBroClient.modelDownloads` for progress.
     case modelDownloading(model: String, alreadyInProgress: Bool)
@@ -12,6 +15,7 @@ public enum BigBroError: Error, LocalizedError {
         switch self {
         case .notPaired: return "Not paired with a BigBro device."
         case .networkError: return "Network error."
+        case .serverError(let message): return message
         case .modelDownloading(let model, let alreadyInProgress):
             return alreadyInProgress
                 ? "Model '\(model)' is still downloading on the Mac."
@@ -26,13 +30,58 @@ public enum ConnectionState: Equatable {
     case connected
 }
 
-private enum ChatStreamEvent {
+/// One message from the Mac, already matched to the request that asked for it.
+private enum PeerEvent {
     case delta(String)
+    case thinking(String)
     case toolCalls([[String: Any]])
+    case audioStart(format: String, sampleRate: Int, channels: Int)
+    case audio(Data)
+    case transcript(text: String, language: String?)
 }
 
-private final class RequestHolder: @unchecked Sendable {
-    var continuation: AsyncThrowingStream<ChatStreamEvent, Error>.Continuation?
+/// Routes inbound messages to the request waiting for them, keyed by `requestId`.
+///
+/// A single slot is not enough: speech overlaps chat by construction, since `converse()`
+/// speaks each finished sentence while the chat response is still streaming. With one slot
+/// the second request's continuation replaces the first, and the first stream never
+/// completes.
+private final class RequestRegistry: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuations: [String: AsyncThrowingStream<PeerEvent, Error>.Continuation] = [:]
+
+    func register(_ requestId: String, _ continuation: AsyncThrowingStream<PeerEvent, Error>.Continuation) {
+        lock.lock(); defer { lock.unlock() }
+        continuations[requestId] = continuation
+    }
+
+    func yield(_ requestId: String, _ event: PeerEvent) {
+        lock.lock()
+        let continuation = continuations[requestId]
+        lock.unlock()
+        continuation?.yield(event)
+    }
+
+    func finish(_ requestId: String, throwing error: Error? = nil) {
+        lock.lock()
+        let continuation = continuations.removeValue(forKey: requestId)
+        lock.unlock()
+        if let error {
+            continuation?.finish(throwing: error)
+        } else {
+            continuation?.finish()
+        }
+    }
+
+    /// Fails every in-flight request — used when the connection drops, so no caller is left
+    /// awaiting a stream that can never complete.
+    func finishAll(throwing error: Error) {
+        lock.lock()
+        let all = continuations
+        continuations.removeAll()
+        lock.unlock()
+        for continuation in all.values { continuation.finish(throwing: error) }
+    }
 }
 
 /// Session-scoped client for BigBro. No persistence — every launch starts
@@ -62,7 +111,7 @@ public final class BigBroClient: ObservableObject {
     private var messageTask: Task<Void, Never>?
     private var autoReconnectTask: Task<Void, Never>?
     private var pendingPairTask: Task<Void, Never>?
-    private let activeRequest = RequestHolder()
+    private let requests = RequestRegistry()
     private let requiredModels: [String]
     private let appName: String
     private var didRegisterLifecycleObservers = false
@@ -184,8 +233,6 @@ public final class BigBroClient: ObservableObject {
         }
         print("[BigBroClient] chat: \(messages.count) message(s), streaming=\(streaming), tools=\(tools.count)")
         return AsyncThrowingStream { continuation in
-            // Cancel any in-flight request before taking over activeRequest
-            self.activeRequest.continuation?.finish(throwing: CancellationError())
             Task { [conn] in
                 var workingMessages = messages.map { $0.toDict() }
                 // Encode tool definitions once — they don't change between loop iterations
@@ -197,8 +244,8 @@ public final class BigBroClient: ObservableObject {
                     while true {
                         let requestId = UUID().uuidString
                         print("[BigBroClient] Request \(requestId.prefix(8)): sending to Mac")
-                        let eventStream = AsyncThrowingStream<ChatStreamEvent, Error> { cont in
-                            self.activeRequest.continuation = cont
+                        let eventStream = AsyncThrowingStream<PeerEvent, Error> { cont in
+                            self.requests.register(requestId, cont)
                         }
                         var msg: [String: Any] = [
                             "type": "request",
@@ -223,6 +270,8 @@ public final class BigBroClient: ObservableObject {
                             case .toolCalls(let calls):
                                 print("[BigBroClient] Tool calls received: \(calls.count)")
                                 pendingToolCalls = calls
+                            default:
+                                break  // audio and transcripts belong to other requests
                             }
                         }
                         guard let calls = pendingToolCalls else {
@@ -297,8 +346,8 @@ public final class BigBroClient: ObservableObject {
         return AsyncThrowingStream { continuation in
             Task { [conn] in
                 let requestId = UUID().uuidString
-                let eventStream = AsyncThrowingStream<ChatStreamEvent, Error> { cont in
-                    self.activeRequest.continuation = cont
+                let eventStream = AsyncThrowingStream<PeerEvent, Error> { cont in
+                    self.requests.register(requestId, cont)
                 }
                 var msg: [String: Any] = [
                     "type": "generateRequest",
@@ -325,8 +374,8 @@ public final class BigBroClient: ObservableObject {
                         switch event {
                         case .delta(let text):
                             if streaming { continuation.yield(text) } else { accumulated += text }
-                        case .toolCalls:
-                            break // /api/generate does not emit tool calls; ignore defensively
+                        default:
+                            break  // generate emits no tool calls, audio or transcripts
                         }
                     }
                     if !streaming { continuation.yield(accumulated) }
@@ -370,42 +419,77 @@ public final class BigBroClient: ObservableObject {
 
     private func dispatch(_ msg: [String: Any]) {
         guard let type = msg["type"] as? String else { return }
-        print("[BigBroClient] dispatch: \(type)")
+        // Audio arrives several times a second; logging every frame drowns the console.
+        if type != "audioChunk" { print("[BigBroClient] dispatch: \(type)") }
+
+        // Connection- and device-level messages carry no requestId.
         switch type {
         case "_reconnecting":
             connectionState = .reconnecting
+            return
         case "_connected":
             connectionState = .connected
-        case "chunk":
-            if let delta = msg["delta"] as? String {
-                activeRequest.continuation?.yield(.delta(delta))
-            }
-        case "toolCall":
-            if let calls = msg["calls"] as? [[String: Any]] {
-                activeRequest.continuation?.yield(.toolCalls(calls))
-            }
-        case "done":
-            activeRequest.continuation?.finish()
-            activeRequest.continuation = nil
+            return
         case "modelsUpdate":
             missingModels = msg["missingModels"] as? [String] ?? []
             print("[BigBroClient] modelsUpdate: missing=\(missingModels)")
+            return
+        case "modelDownloadProgress":
+            applyDownloadProgress(msg, done: false)
+            return
+        case "modelDownloadComplete":
+            applyDownloadProgress(msg, done: true)
+            return
+        default:
+            break
+        }
+
+        // Everything below belongs to one specific in-flight request.
+        guard let requestId = msg["requestId"] as? String else {
+            print("[BigBroClient] dispatch: '\(type)' arrived with no requestId")
+            return
+        }
+
+        switch type {
+        case "chunk":
+            if let delta = msg["delta"] as? String {
+                requests.yield(requestId, .delta(delta))
+            }
+        case "thinking":
+            if let delta = msg["delta"] as? String {
+                requests.yield(requestId, .thinking(delta))
+            }
+        case "toolCall":
+            if let calls = msg["calls"] as? [[String: Any]] {
+                requests.yield(requestId, .toolCalls(calls))
+            }
+        case "audioStart":
+            requests.yield(requestId, .audioStart(
+                format: msg["format"] as? String ?? "pcm",
+                sampleRate: msg["sampleRate"] as? Int ?? 24_000,
+                channels: msg["channels"] as? Int ?? 1
+            ))
+        case "audioChunk":
+            if let base64 = msg["audio"] as? String, let audio = Data(base64Encoded: base64) {
+                requests.yield(requestId, .audio(audio))
+            }
+        case "transcript":
+            requests.yield(requestId, .transcript(
+                text: msg["text"] as? String ?? "",
+                language: msg["language"] as? String
+            ))
+        case "done":
+            requests.finish(requestId)
         case "modelDownloading":
-            // Active request is blocked — model needs to be pulled first.
+            // The request is blocked — the model has to be pulled first.
             let model = msg["model"] as? String ?? ""
             let already = msg["alreadyInProgress"] as? Bool ?? false
             print("[BigBroClient] modelDownloading: \(model) alreadyInProgress=\(already)")
-            activeRequest.continuation?.finish(throwing: BigBroError.modelDownloading(model: model, alreadyInProgress: already))
-            activeRequest.continuation = nil
-        case "modelDownloadProgress":
-            applyDownloadProgress(msg, done: false)
-        case "modelDownloadComplete":
-            applyDownloadProgress(msg, done: true)
+            requests.finish(requestId, throwing: BigBroError.modelDownloading(model: model, alreadyInProgress: already))
         case "error":
             let errMsg = msg["message"] as? String ?? "unknown"
             print("[BigBroClient] Server error: \(errMsg)")
-            activeRequest.continuation?.finish(throwing: BigBroError.networkError)
-            activeRequest.continuation = nil
+            requests.finish(requestId, throwing: BigBroError.serverError(errMsg))
         default:
             print("[BigBroClient] dispatch: unhandled type '\(type)'")
         }
@@ -445,6 +529,9 @@ public final class BigBroClient: ObservableObject {
         connectedDevice = nil
         missingModels = []
         peerConnection = nil
+        // Nothing further will arrive for in-flight requests; fail them rather than leaving
+        // callers awaiting a stream that can never complete.
+        requests.finishAll(throwing: BigBroError.notPaired)
         if autoReconnectEnabled {
             // Re-arm the browse so currently-visible Macs trigger a fresh
             // `.appeared` event and we attempt to reconnect immediately.
