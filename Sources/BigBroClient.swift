@@ -223,8 +223,8 @@ public final class BigBroClient: ObservableObject {
         model: String? = nil,
         streaming: Bool = true,
         tools: [BigBroTool] = [],
-        format: OllamaFormat? = nil,
-        options: OllamaOptions? = nil,
+        format: ResponseFormat? = nil,
+        options: GenerationOptions? = nil,
         think: Bool? = nil,
         keepAlive: String? = nil
     ) -> AsyncThrowingStream<String, Error> {
@@ -332,8 +332,8 @@ public final class BigBroClient: ObservableObject {
         system: String? = nil,
         template: String? = nil,
         model: String? = nil,
-        format: OllamaFormat? = nil,
-        options: OllamaOptions? = nil,
+        format: ResponseFormat? = nil,
+        options: GenerationOptions? = nil,
         raw: Bool? = nil,
         think: Bool? = nil,
         keepAlive: String? = nil,
@@ -505,7 +505,7 @@ public final class BigBroClient: ObservableObject {
         voice: String? = nil,
         tools: [BigBroTool] = [],
         model: String? = nil,
-        options: OllamaOptions? = nil
+        options: GenerationOptions? = nil
     ) -> AsyncThrowingStream<ConverseEvent, Error> {
         AsyncThrowingStream { continuation in
             Task {

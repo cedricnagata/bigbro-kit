@@ -1,6 +1,8 @@
 # BigBroKit
 
-An iOS Swift Package for connecting to a [BigBro](https://github.com/nagata-inc/bigbro) Mac and running LLM inference over the local network. BigBroKit discovers the Mac via Bonjour, establishes a persistent TCP connection, and proxies requests to the Mac's local [Ollama](https://ollama.ai) instance — covering both `/api/chat` (with full tool-calling support) and `/api/generate`.
+An iOS Swift Package for connecting to a [BigBro](https://github.com/nagata-inc/bigbro) Mac and running inference over the local network. BigBroKit discovers the Mac via Bonjour, establishes a persistent TCP connection, and proxies requests to the Mac's local backend.
+
+The Mac talks to an OpenAI-compatible server — [Ollama](https://ollama.ai) by default for chat, [LocalAI](https://localai.io) for speech — so this package covers chat with full tool calling, single-turn generation, text-to-speech and transcription.
 
 ## Requirements
 
@@ -148,7 +150,7 @@ func pair(with device: BigBroDevice) async throws -> Bool
 func disconnect()
 ```
 
-#### Inference — `/api/chat`
+#### Inference — chat
 
 ```swift
 func chat(
@@ -156,14 +158,14 @@ func chat(
     model: String? = nil,         // overrides the Mac's default model
     streaming: Bool = true,       // false → single yield of the full response
     tools: [BigBroTool] = [],     // triggers the agentic tool-call loop
-    format: OllamaFormat? = nil,
-    options: OllamaOptions? = nil,
+    format: ResponseFormat? = nil,
+    options: GenerationOptions? = nil,
     think: Bool? = nil,           // chain-of-thought (supported models only)
     keepAlive: String? = nil      // how long Ollama keeps the model loaded
 ) -> AsyncThrowingStream<String, Error>
 ```
 
-#### Inference — `/api/generate`
+#### Inference — generate
 
 ```swift
 func generate(
@@ -173,8 +175,8 @@ func generate(
     system: String? = nil,
     template: String? = nil,
     model: String? = nil,
-    format: OllamaFormat? = nil,
-    options: OllamaOptions? = nil,
+    format: ResponseFormat? = nil,
+    options: GenerationOptions? = nil,
     raw: Bool? = nil,
     think: Bool? = nil,
     keepAlive: String? = nil,
@@ -216,7 +218,7 @@ func converse(
     voice: String? = nil,
     tools: [BigBroTool] = [],
     model: String? = nil,
-    options: OllamaOptions? = nil
+    options: GenerationOptions? = nil
 ) -> AsyncThrowingStream<ConverseEvent, Error>
 ```
 
@@ -323,12 +325,12 @@ The caller never sees intermediate tool calls — only the final streamed text.
 
 ---
 
-### `OllamaOptions`
+### `GenerationOptions`
 
 Maps directly to Ollama's `options` request field. All fields are optional.
 
 ```swift
-let opts = OllamaOptions(temperature: 0.7, topK: 40, seed: 42)
+let opts = GenerationOptions(temperature: 0.7, topK: 40, seed: 42)
 for try await delta in client.chat(messages, options: opts) { ... }
 ```
 
@@ -348,7 +350,7 @@ for try await delta in client.chat(messages, options: opts) { ... }
 
 ---
 
-### `OllamaFormat`
+### `ResponseFormat`
 
 ```swift
 // Plain JSON mode
@@ -437,7 +439,7 @@ bigbro-kit/
 │   ├── BigBroDevice.swift      — discovered device model
 │   ├── BonjourBrowser.swift    — Bonjour/mDNS discovery (NetServiceBrowser, MainActor)
 │   ├── Message.swift           — chat message model + wire serialization
-│   ├── OllamaOptions.swift     — generation options + OllamaFormat enum
+│   ├── GenerationOptions.swift — generation options + ResponseFormat enum
 │   ├── PeerConnection.swift    — TCP actor (4-byte framed JSON)
 │   └── Tool.swift              — BigBroTool definition + handler
 └── Package.swift

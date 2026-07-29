@@ -1,8 +1,12 @@
 import Foundation
 
-/// Model generation parameters forwarded verbatim to Ollama's `options` field.
-/// All fields are optional — only non-nil values are included in the request.
-public struct OllamaOptions: Sendable {
+/// Model generation parameters. All fields are optional — only non-nil values are sent.
+///
+/// The Mac maps these onto the backend's OpenAI-compatible request: most translate directly,
+/// `numPredict` becomes `max_tokens`, and `topK`, `repeatPenalty`, `numCtx` and `numThread`
+/// have no OpenAI equivalent and are forwarded verbatim for backends that accept them as
+/// extensions.
+public struct GenerationOptions: Sendable {
     public var temperature: Double?
     public var topK: Int?
     public var topP: Double?
@@ -58,14 +62,14 @@ public struct OllamaOptions: Sendable {
     }
 }
 
-/// Ollama response format — either plain JSON mode or a structured JSON schema.
+/// Constrains the response — either plain JSON mode or a structured JSON schema.
 ///
 /// For `jsonSchema`, serialize your schema dict to `Data` before passing:
 /// ```swift
 /// let schemaData = try JSONSerialization.data(withJSONObject: mySchema)
-/// let format = OllamaFormat.jsonSchema(schemaData)
+/// let format = ResponseFormat.jsonSchema(schemaData)
 /// ```
-public enum OllamaFormat: Sendable {
+public enum ResponseFormat: Sendable {
     case json
     case jsonSchema(Data)
 
@@ -78,3 +82,14 @@ public enum OllamaFormat: Sendable {
         }
     }
 }
+
+// MARK: - Compatibility
+
+/// The old names are kept as aliases so existing call sites keep compiling. They predate
+/// BigBro proxying to any OpenAI-compatible backend, and are misleading now that the
+/// backend may not be Ollama at all.
+@available(*, deprecated, renamed: "GenerationOptions")
+public typealias OllamaOptions = GenerationOptions
+
+@available(*, deprecated, renamed: "ResponseFormat")
+public typealias OllamaFormat = ResponseFormat
