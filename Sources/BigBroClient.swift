@@ -1,4 +1,5 @@
 import Foundation
+import NaturalLanguage
 import UIKit
 
 public enum BigBroError: Error, LocalizedError {
@@ -386,6 +387,207 @@ public final class BigBroClient: ObservableObject {
                 }
             }
         }
+    }
+
+    // MARK: - Speech
+
+    /// Streams synthesized audio for `text` from the Mac's speech backend.
+    ///
+    /// Chunks are raw payload in the negotiated format — `pcm` by default, which is 24 kHz
+    /// 16-bit signed little-endian mono and carries no header, so append them in order and
+    /// feed them straight to `AVAudioPlayerNode`.
+    ///
+    /// Independently useful: speaking a canned string costs no LLM call.
+    public func speak(
+        _ text: String,
+        voice: String? = nil,
+        model: String? = nil,
+        responseFormat: String? = nil,
+        speed: Double? = nil
+    ) -> AsyncThrowingStream<Data, Error> {
+        guard let conn = peerConnection else {
+            print("[BigBroClient] speak: not paired")
+            return AsyncThrowingStream { $0.finish(throwing: BigBroError.notPaired) }
+        }
+        return AsyncThrowingStream { continuation in
+            Task { [conn] in
+                let requestId = UUID().uuidString
+                let eventStream = AsyncThrowingStream<PeerEvent, Error> { cont in
+                    self.requests.register(requestId, cont)
+                }
+                var msg: [String: Any] = [
+                    "type": "speechRequest",
+                    "requestId": requestId,
+                    "input": text,
+                ]
+                if let voice          { msg["voice"] = voice }
+                if let model          { msg["model"] = model }
+                if let responseFormat { msg["response_format"] = responseFormat }
+                if let speed          { msg["speed"] = speed }
+
+                do {
+                    try await conn.send(msg)
+                    for try await event in eventStream {
+                        switch event {
+                        case .audio(let data):
+                            continuation.yield(data)
+                        case .audioStart(let format, let sampleRate, let channels):
+                            print("[BigBroClient] audio \(format) \(sampleRate)Hz x\(channels) for \(requestId.prefix(8))")
+                        default:
+                            break
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    print("[BigBroClient] speak error: \(error)")
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// Transcribes a complete recorded utterance.
+    ///
+    /// Batch, not streaming: record a turn, then send it. `format` should match the
+    /// container the audio is actually in — the Mac uses it for both the filename and the
+    /// MIME type it declares upstream.
+    public func transcribe(
+        _ audio: Data,
+        format: String = "wav",
+        model: String? = nil,
+        language: String? = nil
+    ) async throws -> String {
+        guard let conn = peerConnection else {
+            print("[BigBroClient] transcribe: not paired")
+            throw BigBroError.notPaired
+        }
+        let requestId = UUID().uuidString
+        let eventStream = AsyncThrowingStream<PeerEvent, Error> { cont in
+            self.requests.register(requestId, cont)
+        }
+        var msg: [String: Any] = [
+            "type": "transcribeRequest",
+            "requestId": requestId,
+            "audio": audio.base64EncodedString(),
+            "audioFormat": format,
+        ]
+        if let model    { msg["model"] = model }
+        if let language { msg["language"] = language }
+
+        print("[BigBroClient] transcribe: \(audio.count) bytes of \(format)")
+        try await conn.send(msg)
+
+        var text = ""
+        for try await event in eventStream {
+            if case .transcript(let transcribed, _) = event { text = transcribed }
+        }
+        return text
+    }
+
+    // MARK: - Voice loop
+
+    public enum ConverseEvent {
+        case text(String)
+        case audio(Data)
+    }
+
+    /// Runs a chat turn and speaks the answer as it arrives.
+    ///
+    /// Speech is pipelined per sentence rather than waiting for the whole response, so time
+    /// to first audio is one sentence plus synthesis rather than a full generation.
+    ///
+    /// This is a composition over `chat()` and `speak()` rather than a server-side mode
+    /// because the tool-calling loop runs here: only the client knows which turn is a final
+    /// answer and which is an intermediate tool step, so only the client can decide what is
+    /// worth speaking.
+    public func converse(
+        _ messages: [Message],
+        voice: String? = nil,
+        tools: [BigBroTool] = [],
+        model: String? = nil,
+        options: OllamaOptions? = nil
+    ) -> AsyncThrowingStream<ConverseEvent, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                // Sentences are spoken strictly in order. Concurrent speech requests can
+                // finish out of order, which would shuffle the audio.
+                let (sentences, enqueue) = AsyncStream<String>.makeStream()
+
+                let speaker = Task {
+                    for await sentence in sentences {
+                        do {
+                            for try await audio in self.speak(sentence, voice: voice) {
+                                continuation.yield(.audio(audio))
+                            }
+                        } catch {
+                            continuation.finish(throwing: error)
+                            return
+                        }
+                    }
+                }
+
+                do {
+                    var buffer = ""
+                    for try await delta in self.chat(messages, model: model, tools: tools, options: options) {
+                        continuation.yield(.text(delta))
+                        buffer += delta
+                        while let sentence = Self.takeSentence(&buffer) {
+                            if let speakable = Self.speakable(sentence) { enqueue.yield(speakable) }
+                        }
+                    }
+                    if let speakable = Self.speakable(buffer) { enqueue.yield(speakable) }
+                    enqueue.finish()
+                    await speaker.value
+                    continuation.finish()
+                } catch {
+                    enqueue.finish()
+                    speaker.cancel()
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// Removes the leading complete sentence from `buffer`, leaving any partial tail.
+    ///
+    /// Uses `NLTokenizer` rather than splitting on "." — decimals, abbreviations and
+    /// ellipses all defeat naive splitting. A sentence only counts as complete once another
+    /// has started behind it, since the final one is still being written to.
+    private static func takeSentence(_ buffer: inout String) -> String? {
+        guard !buffer.isEmpty else { return nil }
+        let tokenizer = NLTokenizer(unit: .sentence)
+        tokenizer.string = buffer
+
+        var ranges: [Range<String.Index>] = []
+        tokenizer.enumerateTokens(in: buffer.startIndex..<buffer.endIndex) { range, _ in
+            ranges.append(range)
+            return true
+        }
+        guard ranges.count > 1, let first = ranges.first else { return nil }
+
+        let sentence = String(buffer[first])
+        buffer = String(buffer[first.upperBound...])
+        return sentence
+    }
+
+    /// Prepares text for synthesis, or returns nil when nothing is left worth speaking.
+    ///
+    /// Code fences, link targets, bare URLs and table pipes are all noise read aloud.
+    private static func speakable(_ text: String) -> String? {
+        var out = text
+        let substitutions: [(pattern: String, replacement: String)] = [
+            ("```[\\s\\S]*?```", " "),                  // fenced code
+            ("`([^`]*)`", "$1"),                        // inline code
+            ("\\[([^\\]]*)\\]\\([^)]*\\)", "$1"),       // links: keep the label
+            ("https?://\\S+", " "),                     // bare URLs
+            ("[*_#>|~]", " "),                          // emphasis, headings, table pipes
+            ("\\s+", " "),
+        ]
+        for (pattern, replacement) in substitutions {
+            out = out.replacingOccurrences(of: pattern, with: replacement, options: .regularExpression)
+        }
+        out = out.trimmingCharacters(in: .whitespacesAndNewlines)
+        return out.isEmpty ? nil : out
     }
 
     public func disconnect() {

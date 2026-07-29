@@ -182,7 +182,68 @@ func generate(
 ) -> AsyncThrowingStream<String, Error>
 ```
 
-`generate()` does not support tools — `/api/generate` is a raw completion endpoint.
+`generate()` does not support tools — it is a single-turn completion.
+
+> The Mac proxies to an OpenAI-compatible backend, so `template`, `raw` and `suffix` have no
+> equivalent and return an error rather than being silently ignored. `think` is translated to
+> `reasoning_effort`, and reasoning arrives as a separate `thinking` message so it is never
+> mixed into the answer — or spoken.
+
+---
+
+#### Speech — `speak()`, `transcribe()`, `converse()`
+
+Requires a speech backend enabled on the Mac (LocalAI by default; Speaches works too).
+
+```swift
+func speak(
+    _ text: String,
+    voice: String? = nil,
+    model: String? = nil,
+    responseFormat: String? = nil,   // "pcm" (default), "wav", "mp3", "opus", "flac"
+    speed: Double? = nil
+) -> AsyncThrowingStream<Data, Error>
+
+func transcribe(
+    _ audio: Data,
+    format: String = "wav",
+    model: String? = nil,
+    language: String? = nil
+) async throws -> String
+
+func converse(
+    _ messages: [Message],
+    voice: String? = nil,
+    tools: [BigBroTool] = [],
+    model: String? = nil,
+    options: OllamaOptions? = nil
+) -> AsyncThrowingStream<ConverseEvent, Error>
+```
+
+`speak()` yields raw audio chunks. The default `pcm` is 24 kHz 16-bit signed little-endian
+mono with no header — append the chunks in order and feed them to `AVAudioPlayerNode`.
+Speaking a canned string costs no LLM call.
+
+`transcribe()` is batch, not streaming: record a complete turn, then send it. Uploads are
+capped at 10 MB. Your app needs `NSMicrophoneUsageDescription` to record.
+
+`converse()` runs a chat turn and speaks the answer as it arrives, one sentence at a time,
+so time to first audio is a single sentence rather than a whole generation:
+
+```swift
+for try await event in client.converse([.user("What's the weather like?")], voice: "af_heart") {
+    switch event {
+    case .text(let delta):  transcript += delta
+    case .audio(let chunk): player.enqueue(chunk)
+    }
+}
+```
+
+Sentences are segmented with `NLTokenizer` and stripped of markdown — code fences, link
+targets and table pipes are noise read aloud. Speech requests are serialized, so audio can
+never arrive out of order. The tool-calling loop still runs on the device, which is why
+`converse()` is a composition over `chat()` and `speak()` rather than a Mac-side mode: only
+the client knows which turn is a final answer and which is an intermediate tool step.
 
 ---
 
@@ -321,8 +382,10 @@ public struct BigBroDevice: Identifiable, Hashable {
 
 ```swift
 public enum BigBroError: LocalizedError {
-    case notPaired      // chat() or generate() called before a successful pair()
-    case networkError   // TCP failure
+    case notPaired            // a request was made before a successful pair()
+    case networkError         // TCP failure
+    case serverError(String)  // the Mac reported a failure; the message is actionable
+    case modelDownloading(model: String, alreadyInProgress: Bool)
 }
 ```
 
@@ -389,14 +452,23 @@ BigBroKit communicates with the Mac over TCP on port 8765. Each message is a 4-b
 | `hello` | `deviceId`, `deviceName`, `appName`, `requiredModels?` | Initiate pairing |
 | `request` | `requestId`, `messages`, `streaming`, `tools?`, `model?`, … | Chat inference |
 | `generateRequest` | `requestId`, `prompt`, `streaming`, `images?`, … | Generate inference |
+| `speechRequest` | `requestId`, `input`, `voice?`, `model?`, `response_format?`, `speed?` | Text to speech |
+| `transcribeRequest` | `requestId`, `audio` (base64), `audioFormat?`, `model?`, `language?` | Speech to text |
 | `bye` | — | Clean disconnect |
 
 | Mac → iOS | Fields | Purpose |
 |---|---|---|
 | `helloAck` | `status`, `missingModels?` | Pairing result |
 | `chunk` | `requestId`, `delta` | Streamed text token |
-| `toolCall` | `requestId`, `calls` | Tool calls array from Ollama |
+| `thinking` | `requestId`, `delta` | Reasoning token, never mixed into `chunk` |
+| `toolCall` | `requestId`, `calls` | Tool calls array |
+| `audioStart` | `requestId`, `format`, `sampleRate`, `channels`, `model`, `voice` | Precedes audio so playback can be configured |
+| `audioChunk` | `requestId`, `audio` (base64), `seq` | Synthesized audio |
+| `transcript` | `requestId`, `text`, `language?` | Transcription result |
 | `done` | `requestId` | Request complete |
 | `error` | `requestId`, `message` | Inference error |
+
+Every response carries a `requestId` and the client routes on it, so chat, speech and
+transcription can be in flight simultaneously — which `converse()` relies on.
 | `modelsUpdate` | `missingModels` | Live push when Ollama model list changes |
 | `bye` | — | Clean disconnect |
