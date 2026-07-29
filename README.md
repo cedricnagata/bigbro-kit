@@ -191,6 +191,23 @@ func generate(
 > `reasoning_effort`, and reasoning arrives as a separate `thinking` message so it is never
 > mixed into the answer — or spoken.
 
+#### Inference — preload
+
+```swift
+func preloadModel(vision: Bool = false) async throws
+```
+
+Loads a model into memory on the Mac ahead of time, without generating anything. The Mac only
+materializes a model's weights into memory the first time a request actually needs it — for a
+large model, a real multi-second cost that otherwise lands on whichever message happens to be
+first. Call this when a chat session is likely to start soon (e.g. when the chat screen
+appears) to pay that cost earlier instead.
+
+Purely an optimization: safe to skip, and safe to call more than once. Throws
+`BigBroError.modelDownloading` if the model isn't downloaded yet (the download starts either
+way — watch `modelDownloads` and retry once it completes, or just proceed to `chat()`/`generate()`,
+which will wait on the same download).
+
 ---
 
 #### Speech — `speak()`, `transcribe()`, `converse()`
@@ -471,6 +488,7 @@ BigBroKit communicates with the Mac over TCP on port 8765. Each message is a 4-b
 | `generateRequest` | `requestId`, `prompt`, `streaming`, `images?`, … | Generate inference |
 | `speechRequest` | `requestId`, `input`, `voice?`, `model?`, `response_format?`, `speed?` | Text to speech |
 | `transcribeRequest` | `requestId`, `audio` (base64), `audioFormat?`, `model?`, `language?` | Speech to text |
+| `preload` | `requestId`, `model?` (`"text"` / `"vision"`) | Load a model into memory ahead of the first message |
 | `bye` | — | Clean disconnect |
 
 | Mac → iOS | Fields | Purpose |

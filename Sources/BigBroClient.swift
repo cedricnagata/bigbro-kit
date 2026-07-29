@@ -216,8 +216,12 @@ public final class BigBroClient: ObservableObject {
     ///   - tools: Tools the model may call; the agentic loop runs transparently.
     ///   - format: Constrain the response to JSON or a specific JSON schema.
     ///   - options: Low-level Ollama model parameters (temperature, top_k, etc.).
-    ///   - think: Enable chain-of-thought reasoning (supported models only).
+    ///   - think: Whether the Mac should forward the model's reasoning/analysis tokens. The
+    ///     model generates them either way; this only controls whether they're sent to you
+    ///     (via `onThinking`) or discarded on the Mac. Defaults to on for backward compatibility.
     ///   - keepAlive: How long Ollama should keep the model loaded after the request.
+    ///   - onThinking: Called with each reasoning token as it streams in, ahead of the final
+    ///     answer. Ignored unless `think` is `true`.
     public func chat(
         _ messages: [Message],
         model: String? = nil,
@@ -226,7 +230,8 @@ public final class BigBroClient: ObservableObject {
         format: ResponseFormat? = nil,
         options: GenerationOptions? = nil,
         think: Bool? = nil,
-        keepAlive: String? = nil
+        keepAlive: String? = nil,
+        onThinking: (@Sendable (String) -> Void)? = nil
     ) -> AsyncThrowingStream<String, Error> {
         guard let conn = peerConnection else {
             print("[BigBroClient] chat: not paired")
@@ -268,6 +273,8 @@ public final class BigBroClient: ObservableObject {
                             switch event {
                             case .delta(let text):
                                 if streaming { continuation.yield(text) } else { accumulated += text }
+                            case .thinking(let text):
+                                onThinking?(text)
                             case .toolCalls(let calls):
                                 print("[BigBroClient] Tool calls received: \(calls.count)")
                                 pendingToolCalls = calls
@@ -387,6 +394,43 @@ public final class BigBroClient: ObservableObject {
                 }
             }
         }
+    }
+
+    /// Loads a model into memory on the Mac ahead of time, without generating anything.
+    ///
+    /// BigBro only pays the cost of materializing a model's weights into memory the first
+    /// time a request actually needs it — for a large model that can be several seconds,
+    /// landing on whatever the user's first message happens to be. Calling this when a chat
+    /// session is likely to start soon (e.g. when the chat screen appears) moves that cost
+    /// earlier, so it doesn't show up as latency on the first real message.
+    ///
+    /// Purely an optimization — safe to skip, and safe to call more than once (loading an
+    /// already-loaded model is a fast no-op on the Mac).
+    ///
+    /// - Parameter vision: Preload the vision-capable model instead of the text model. Pick
+    ///   whichever the session is more likely to need first; either loads independently and
+    ///   both can be resident on the Mac at once.
+    /// - Throws: `BigBroError.modelDownloading` if the model isn't downloaded yet on the Mac
+    ///   (the download starts either way; watch `modelDownloads` for progress and retry once
+    ///   it completes).
+    public func preloadModel(vision: Bool = false) async throws {
+        guard let conn = peerConnection else {
+            print("[BigBroClient] preloadModel: not paired")
+            throw BigBroError.notPaired
+        }
+        let requestId = UUID().uuidString
+        let eventStream = AsyncThrowingStream<PeerEvent, Error> { cont in
+            self.requests.register(requestId, cont)
+        }
+        let msg: [String: Any] = [
+            "type": "preload",
+            "requestId": requestId,
+            "model": vision ? "vision" : "text",
+        ]
+        print("[BigBroClient] preloadModel: vision=\(vision)")
+        try await conn.send(msg)
+        // Preload emits no events of its own — this just waits for done/error.
+        for try await _ in eventStream {}
     }
 
     // MARK: - Speech
