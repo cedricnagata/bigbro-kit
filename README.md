@@ -218,17 +218,28 @@ and lowers the budget to `low`. Set `reasoningEffort` when you want to say so ou
 always wins over that inference, so `think: false` + `.high` means "think hard, just don't show
 me the working".
 
-#### Inference — preload
+#### Inference — run / stop
 
 ```swift
-func preloadModel(vision: Bool = false) async throws
+func runModel(vision: Bool = false) async throws
+func runModel(_ model: String?) async throws     // name the model outright
+func stopModel(_ model: String? = nil) async throws
 ```
 
-Loads a model into memory on the Mac ahead of time, without generating anything. The Mac only
-materializes a model's weights into memory the first time a request actually needs it — for a
-large model, a real multi-second cost that otherwise lands on whichever message happens to be
-first. Call this when a chat session is likely to start soon (e.g. when the chat screen
-appears) to pay that cost earlier instead.
+Downloaded and running are different states on the Mac: weights on disk cost only disk, weights
+in memory cost RAM — 12 GB of it for gpt-oss-20b. `runModel` moves a model from the first to the
+second; `stopModel` moves it back, keeping the download.
+
+Removing a download is deliberately not available here. It is destructive and irreversible over
+a slow re-download, so it belongs to whoever owns the Mac, in BigBro's Settings. Note too that
+models are shared across paired devices — stopping one takes it away from all of them, not just
+this device.
+
+Starts a model on the Mac ahead of time, without generating anything. The Mac materializes a
+model's weights into memory the first time a request actually needs it — for a large model, a
+real multi-second cost that otherwise lands on whichever message happens to be first. Call this
+when a chat session is likely to start soon (e.g. when the chat screen appears) to pay that
+cost earlier instead.
 
 Purely an optimization: safe to skip, and safe to call more than once. Throws
 `BigBroError.modelDownloading` if the model isn't downloaded yet (the download starts either
@@ -242,14 +253,22 @@ getting to the chat screen:
 client.$connectionState
     .sink { state in
         guard state == .connected else { return }
-        Task { try? await client.preloadModel() }
+        Task { try? await client.runModel(nil) }
     }
     .store(in: &cancellables)
 ```
 
-A Mac running a build older than the `preload` message ignores it and answers nothing, so the
+The `vision:` form asks the Mac for whichever model it has configured for that capability. The
+`String?` form names one outright — use it when the app lets the user pick a model, so the one
+that gets started is the one the next message will actually use. Passing `nil` falls back to
+the Mac's default.
+
+A Mac running a build that doesn't know these messages ignores them and answers nothing, so the
 call gives up after three minutes rather than hanging forever. That timeout returns normally —
-it isn't surfaced as an error, since preloading is optional either way.
+it isn't surfaced as an error, since both are optional either way.
+
+`preloadModel(vision:)` and `preloadSpeech()` remain as deprecated aliases. The old name
+suggested a cache warm-up; a model that has been run stays running until stopped.
 
 ---
 
@@ -294,8 +313,9 @@ func converse(
     reasoningEffort: ReasoningEffort? = nil
 ) -> AsyncThrowingStream<ConverseEvent, Error>
 
-// Warms Kokoro and Parakeet on the Mac before a voice session starts.
-func preloadSpeech() async throws
+// Starts Kokoro and Parakeet on the Mac before a voice session begins. No matching stop:
+// the speech models are shared by every paired device and reload slowly.
+func runSpeech() async throws
 ```
 
 `speak()` yields raw audio chunks. The default `pcm` is 24 kHz 16-bit signed little-endian mono
@@ -617,7 +637,8 @@ BigBroKit communicates with the Mac over TCP on port 8765. Each message is a 4-b
 | `generateRequest` | `requestId`, `prompt`, `streaming`, `images?`, `think?`, `reasoning_effort?`, … | Generate inference |
 | `speechRequest` | `requestId`, `input`, `voice?`, `model?`, `response_format?`, `speed?` | Text to speech |
 | `transcribeRequest` | `requestId`, `audio` (base64), `audioFormat?`, `model?`, `language?` | Speech to text |
-| `preload` | `requestId`, `model?` (`"text"` / `"vision"`) | Load a model into memory ahead of the first message |
+| `run` | `requestId`, `model?` (`"text"` / `"vision"` / `"speech"`, or a model id) | Start a model — put its weights in memory |
+| `stop` | `requestId`, `model?` (`"text"` / `"vision"`, or a model id) | Stop a model, keeping its download |
 | `bye` | — | Clean disconnect |
 
 | Mac → iOS | Fields | Purpose |
