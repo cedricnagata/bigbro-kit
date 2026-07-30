@@ -97,6 +97,10 @@ public final class BigBroClient: ObservableObject {
     /// continuously while pulls are active; entries are removed shortly after
     /// completion.
     @Published public private(set) var modelDownloads: [String: ModelDownloadProgress] = [:]
+    /// Human-readable notes from the Mac about what the model running the last request could
+    /// not do — tools dropped, reasoning effort ignored, a vision model substituted. Empty
+    /// when the model handled everything asked of it. Cleared at the start of each `chat()`.
+    @Published public private(set) var modelNotes: [String] = []
     /// Bonjour service names of Macs the user has previously paired with.
     @Published public private(set) var pairedDeviceNames: Set<String> = []
     /// Whether auto-reconnect is currently active.
@@ -243,6 +247,7 @@ public final class BigBroClient: ObservableObject {
             return AsyncThrowingStream { $0.finish(throwing: BigBroError.notPaired) }
         }
         print("[BigBroClient] chat: \(messages.count) message(s), streaming=\(streaming), tools=\(tools.count)")
+        modelNotes = []
         return AsyncThrowingStream { continuation in
             let work = Task { [conn] in
                 var workingMessages = messages.map { $0.toDict() }
@@ -809,6 +814,16 @@ public final class BigBroClient: ObservableObject {
         case "modelsUpdate":
             missingModels = msg["missingModels"] as? [String] ?? []
             print("[BigBroClient] modelsUpdate: missing=\(missingModels)")
+            return
+        case "modelCapabilities":
+            // The Mac ran the request on a model that couldn't do everything asked of it.
+            // Surfaced rather than swallowed: a dropped tool produces a perfectly ordinary
+            // answer that simply never calls the tool, which is indistinguishable from the
+            // model choosing not to unless someone says so.
+            modelNotes = msg["notes"] as? [String] ?? []
+            if !modelNotes.isEmpty {
+                print("[BigBroClient] modelCapabilities: \(modelNotes.joined(separator: " "))")
+            }
             return
         case "modelDownloadProgress":
             applyDownloadProgress(msg, done: false)
