@@ -278,8 +278,24 @@ func converse(
     voice: String? = nil,
     tools: [BigBroTool] = [],
     model: String? = nil,
-    options: GenerationOptions? = nil
+    options: GenerationOptions? = nil,
+    reasoningEffort: ReasoningEffort? = nil
 ) -> AsyncThrowingStream<ConverseEvent, Error>
+
+// Speech in, speech out — one whole spoken turn.
+func converse(
+    audio: Data,
+    format: String = "wav",
+    history: [Message] = [],
+    voice: String? = nil,
+    tools: [BigBroTool] = [],
+    model: String? = nil,
+    options: GenerationOptions? = nil,
+    reasoningEffort: ReasoningEffort? = nil
+) -> AsyncThrowingStream<ConverseEvent, Error>
+
+// Warms Kokoro and Parakeet on the Mac before a voice session starts.
+func preloadSpeech() async throws
 ```
 
 `speak()` yields raw audio chunks. The default `pcm` is 24 kHz 16-bit signed little-endian mono
@@ -311,7 +327,8 @@ so time to first audio is a single sentence rather than a whole generation:
 for try await event in client.converse([.user("What's the weather like?")], voice: "af_heart") {
     switch event {
     case .text(let delta):  transcript += delta
-    case .audio(let chunk): player.enqueue(chunk)
+    case .audio(let chunk): audioIn.yield(chunk)
+    case .transcript:       break   // only the audio-in overload produces this
     }
 }
 ```
@@ -321,6 +338,75 @@ targets and table pipes are noise read aloud. Speech requests are serialized, so
 never arrive out of order. The tool-calling loop still runs on the device, which is why
 `converse()` is a composition over `chat()` and `speak()` rather than a Mac-side mode: only
 the client knows which turn is a final answer and which is an intermediate tool step.
+
+The `audio:` overload closes the loop — transcribe, answer, speak, in one call. It yields
+`.transcript` first, then `.text` and `.audio` interleaved:
+
+```swift
+for try await event in client.converse(audio: wav, history: history, tools: myTools) {
+    switch event {
+    case .transcript(let heard): print("you said: \(heard)")
+    case .text(let delta):       reply += delta
+    case .audio(let chunk):      audioIn.yield(chunk)
+    }
+}
+```
+
+An utterance that transcribes to nothing finishes after `.transcript("")` without generating,
+so a hands-free loop can ignore empty transcripts rather than treating a cough as a turn.
+
+---
+
+### `BigBroMicrophone` — capture with endpointing
+
+`transcribe()` needs a complete recording, which leaves you to decide when a turn ended.
+Push-to-talk answers that with a button; a hands-free loop has to answer it from the audio.
+`BigBroMicrophone` watches signal energy and emits one 16 kHz WAV per utterance:
+
+```swift
+let mic = BigBroMicrophone()
+for try await utterance in mic.utterances() {
+    let text = try await client.transcribe(utterance, format: "wav")
+}
+```
+
+Published state — `isCapturing`, `isSpeaking`, `level` — drives listening indicators and
+meters. `Tuning` exposes the endpointing thresholds; `hangoverDuration` (default 0.7 s) is the
+one that decides how responsive the loop feels against how badly it clips people who pause
+mid-sentence. A 0.3 s preroll is kept so the opening consonant isn't lost, since by the time
+energy crosses the threshold the word has already started.
+
+Requires `NSMicrophoneUsageDescription`.
+
+---
+
+### `BigBroVoiceSession` — the whole loop
+
+Listen, transcribe, answer (with tools), speak, repeat — continuously, hands-free.
+
+```swift
+let session = BigBroVoiceSession(client: client, tools: myTools)
+await session.start()
+// session.phase, .transcript, .reply, .level, .history are all @Published
+session.stop()
+```
+
+It owns the pieces that only matter once the legs run continuously: conversation history
+across turns, one `AVAudioSession` that capture and playback can share, and barge-in.
+
+**Barge-in** is on by default. Talking over an answer cuts it off and starts a new turn — and
+that cancellation propagates, so the Mac stops generating rather than finishing an answer
+nobody will hear. The interrupted turn is still committed to history, partial answer included,
+so a follow-up like "sorry, go on" has something to refer to.
+
+The session sets `.playAndRecord` with mode `.voiceChat`, which is what enables the system
+echo canceller. Without it the microphone hears the assistant's own voice, the endpointer
+reads that as the user talking, and the loop interrupts itself in a cycle that never settles.
+If echo cancellation is failing on some device, `allowsBargeIn = false` makes the loop
+half-duplex instead of letting it argue with itself.
+
+`setHistory(_:)` adopts an existing conversation, so switching from typing to voice continues
+it rather than starting over.
 
 ---
 

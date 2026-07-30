@@ -244,7 +244,7 @@ public final class BigBroClient: ObservableObject {
         }
         print("[BigBroClient] chat: \(messages.count) message(s), streaming=\(streaming), tools=\(tools.count)")
         return AsyncThrowingStream { continuation in
-            Task { [conn] in
+            let work = Task { [conn] in
                 var workingMessages = messages.map { $0.toDict() }
                 // Encode tool definitions once — they don't change between loop iterations
                 let encodedTools: [Any] = (try? tools.map { t -> Any in
@@ -276,6 +276,10 @@ public final class BigBroClient: ObservableObject {
                         var accumulated = ""
                         var pendingToolCalls: [[String: Any]]? = nil
                         for try await event in eventStream {
+                            // Abandoning the response mid-flight — barge-in, a closed screen —
+                            // should stop the work, not just stop watching it. Checked here
+                            // because this is where the task actually spends its time.
+                            if Task.isCancelled { break }
                             switch event {
                             case .delta(let text):
                                 if streaming { continuation.yield(text) } else { accumulated += text }
@@ -287,6 +291,10 @@ public final class BigBroClient: ObservableObject {
                             default:
                                 break  // audio and transcripts belong to other requests
                             }
+                        }
+                        if Task.isCancelled {
+                            print("[BigBroClient] Request \(requestId.prefix(8)): cancelled")
+                            break
                         }
                         guard let calls = pendingToolCalls else {
                             print("[BigBroClient] Request \(requestId.prefix(8)): done")
@@ -318,6 +326,10 @@ public final class BigBroClient: ObservableObject {
                     continuation.finish(throwing: error)
                 }
             }
+            // Iterating an AsyncThrowingStream does not cancel whatever is producing it, so
+            // without this a consumer that walks away leaves the tool loop running and the
+            // Mac generating an answer nobody will read.
+            continuation.onTermination = { _ in work.cancel() }
         }
     }
 
@@ -424,21 +436,37 @@ public final class BigBroClient: ObservableObject {
     ///   (the download starts either way; watch `modelDownloads` for progress and retry once
     ///   it completes).
     public func preloadModel(vision: Bool = false) async throws {
+        try await preload(model: vision ? "vision" : "text")
+    }
+
+    /// Loads the speech models — text-to-speech and transcription — into memory on the Mac.
+    ///
+    /// Matters more for a voice loop than the chat preload does. The Mac warms these at launch
+    /// when speech is enabled, but a device that connects while that is still running would
+    /// otherwise pay the remainder on the user's first spoken words, which is exactly the
+    /// moment a hands-free loop looks broken. Awaiting this before starting a session moves
+    /// the wait somewhere it can be shown.
+    ///
+    /// - Throws: `BigBroError.serverError` if speech is switched off on the Mac.
+    public func preloadSpeech() async throws {
+        try await preload(model: "speech")
+    }
+
+    private func preload(model: String) async throws {
         guard let conn = peerConnection else {
-            print("[BigBroClient] preloadModel: not paired")
+            print("[BigBroClient] preload: not paired")
             throw BigBroError.notPaired
         }
         let requestId = UUID().uuidString
         let eventStream = AsyncThrowingStream<PeerEvent, Error> { cont in
             self.requests.register(requestId, cont)
         }
-        let msg: [String: Any] = [
+        print("[BigBroClient] preload: \(model)")
+        try await conn.send([
             "type": "preload",
             "requestId": requestId,
-            "model": vision ? "vision" : "text",
-        ]
-        print("[BigBroClient] preloadModel: vision=\(vision)")
-        try await conn.send(msg)
+            "model": model,
+        ])
 
         // Preload emits no events of its own — this just waits for done/error, or for the
         // timeout to rule the Mac unable to answer. The timeout is not decoration: a BigBro
@@ -449,7 +477,7 @@ public final class BigBroClient: ObservableObject {
         let wait = Task { for try await _ in eventStream {} }
         let timeout = Task {
             try await Task.sleep(for: Self.preloadTimeout)
-            print("[BigBroClient] preloadModel: no response from the Mac, giving up")
+            print("[BigBroClient] preload: no response from the Mac, giving up")
             self.requests.finish(requestId)
         }
         defer { timeout.cancel() }
@@ -558,8 +586,70 @@ public final class BigBroClient: ObservableObject {
     // MARK: - Voice loop
 
     public enum ConverseEvent {
+        /// What the user was heard to say. Only produced by the audio-in overload, and always
+        /// before any `.text` — the caller can show it as soon as the turn is understood.
+        case transcript(String)
         case text(String)
         case audio(Data)
+    }
+
+    /// One spoken turn, end to end: transcribe what was said, answer it, speak the answer.
+    ///
+    /// This is the whole voice pipeline in a single call — speech in, speech out, with the
+    /// tool-calling loop running in between. `history` is the conversation so far; the
+    /// transcribed turn is appended to it, so pass the same array back (with the new user and
+    /// assistant messages) on the next call to keep context.
+    ///
+    /// Events arrive in order: `.transcript` once, then `.text` and `.audio` interleaved as
+    /// the answer is generated and synthesized sentence by sentence.
+    ///
+    /// An utterance that transcribes to nothing — a cough, a door — finishes the stream after
+    /// `.transcript("")` without generating anything, so a hands-free loop can simply ignore
+    /// empty transcripts rather than treating silence as a turn.
+    ///
+    /// - Parameters:
+    ///   - audio: A complete recorded utterance. `BigBroMicrophone` produces these already
+    ///     endpointed; otherwise record a turn and pass it whole.
+    ///   - format: Container `audio` is in. WAV is what `BigBroMicrophone` emits.
+    ///   - history: Conversation so far, not including this turn.
+    public func converse(
+        audio: Data,
+        format: String = "wav",
+        history: [Message] = [],
+        voice: String? = nil,
+        tools: [BigBroTool] = [],
+        model: String? = nil,
+        options: GenerationOptions? = nil,
+        reasoningEffort: ReasoningEffort? = nil
+    ) -> AsyncThrowingStream<ConverseEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let work = Task {
+                do {
+                    let heard = try await self.transcribe(audio, format: format)
+                    continuation.yield(.transcript(heard))
+
+                    let spoken = heard.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !spoken.isEmpty else {
+                        print("[BigBroClient] converse: empty transcript, nothing to answer")
+                        continuation.finish()
+                        return
+                    }
+
+                    let messages = history + [.user(spoken)]
+                    for try await event in self.converse(messages, voice: voice, tools: tools,
+                                                         model: model, options: options,
+                                                         reasoningEffort: reasoningEffort) {
+                        if Task.isCancelled { break }
+                        continuation.yield(event)
+                    }
+                    continuation.finish()
+                } catch {
+                    print("[BigBroClient] converse(audio:) error: \(error)")
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in work.cancel() }
+        }
     }
 
     /// Runs a chat turn and speaks the answer as it arrives.
@@ -580,13 +670,14 @@ public final class BigBroClient: ObservableObject {
         reasoningEffort: ReasoningEffort? = nil
     ) -> AsyncThrowingStream<ConverseEvent, Error> {
         AsyncThrowingStream { continuation in
-            Task {
+            let work = Task {
                 // Sentences are spoken strictly in order. Concurrent speech requests can
                 // finish out of order, which would shuffle the audio.
                 let (sentences, enqueue) = AsyncStream<String>.makeStream()
 
                 let speaker = Task {
                     for await sentence in sentences {
+                        if Task.isCancelled { return }
                         do {
                             for try await audio in self.speak(sentence, voice: voice) {
                                 continuation.yield(.audio(audio))
@@ -602,11 +693,20 @@ public final class BigBroClient: ObservableObject {
                     var buffer = ""
                     for try await delta in self.chat(messages, model: model, tools: tools,
                                                      options: options, reasoningEffort: reasoningEffort) {
+                        if Task.isCancelled { break }
                         continuation.yield(.text(delta))
                         buffer += delta
                         while let sentence = Self.takeSentence(&buffer) {
                             if let speakable = Self.speakable(sentence) { enqueue.yield(speakable) }
                         }
+                    }
+                    // An interrupted answer must not keep speaking. Anything already queued is
+                    // dropped rather than synthesized into a stream nobody is playing.
+                    if Task.isCancelled {
+                        enqueue.finish()
+                        speaker.cancel()
+                        continuation.finish()
+                        return
                     }
                     if let speakable = Self.speakable(buffer) { enqueue.yield(speakable) }
                     enqueue.finish()
@@ -618,6 +718,7 @@ public final class BigBroClient: ObservableObject {
                     continuation.finish(throwing: error)
                 }
             }
+            continuation.onTermination = { _ in work.cancel() }
         }
     }
 
