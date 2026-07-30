@@ -54,9 +54,9 @@ public final class BigBroVoiceSession: ObservableObject {
     public var tools: [BigBroTool]
     /// Kokoro voice for the answer. `nil` uses `BigBroClient.defaultVoice`.
     public var voice: String?
-    /// Model to answer with. `nil` uses the Mac's configured default. A model that can't call
-    /// tools still answers — the Mac drops them and says so.
-    public var model: String?
+    /// Model to answer with. Required — the Mac keeps no default. A model that can't call
+    /// tools still answers; the Mac drops them and says so.
+    public var model: String
     public var reasoningEffort: ReasoningEffort?
     /// When false, anything the user says while the answer plays is discarded instead of
     /// cutting it off. Worth turning off only if echo cancellation is failing and the loop is
@@ -74,9 +74,9 @@ public final class BigBroVoiceSession: ObservableObject {
 
     public init(
         client: BigBroClient,
+        model: String,
         tools: [BigBroTool] = [],
         voice: String? = nil,
-        model: String? = nil,
         reasoningEffort: ReasoningEffort? = nil,
         systemPrompt: String? = nil,
         allowsBargeIn: Bool = true,
@@ -236,10 +236,10 @@ public final class BigBroVoiceSession: ObservableObject {
         do {
             for try await event in client.converse(
                 audio: audio,
+                model: model,
                 history: history,
                 voice: voice,
                 tools: tools,
-                model: model,
                 reasoningEffort: reasoningEffort
             ) {
                 if Task.isCancelled { break }

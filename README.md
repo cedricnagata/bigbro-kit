@@ -155,7 +155,7 @@ func disconnect()
 ```swift
 func chat(
     _ messages: [Message],
-    model: String? = nil,         // overrides the Mac's default model
+    model: String,                // required — the Mac has no default
     streaming: Bool = true,       // false → single yield of the full response
     tools: [BigBroTool] = [],     // triggers the agentic tool-call loop
     format: ResponseFormat? = nil,
@@ -171,11 +171,11 @@ func chat(
 ```swift
 func generate(
     prompt: String,
-    images: [Data] = [],          // multimodal models only; base64 is handled internally
+    model: String,                // required — must be a vision model if `images` is non-empty
+    images: [Data] = [],          // vision models only; base64 is handled internally
     suffix: String? = nil,
     system: String? = nil,
     template: String? = nil,
-    model: String? = nil,
     format: ResponseFormat? = nil,
     options: GenerationOptions? = nil,
     raw: Bool? = nil,
@@ -221,9 +221,8 @@ me the working".
 #### Inference — run / stop
 
 ```swift
-func runModel(vision: Bool = false) async throws
-func runModel(_ model: String?) async throws     // name the model outright
-func stopModel(_ model: String? = nil) async throws
+func runModel(_ model: String) async throws
+func stopModel(_ model: String) async throws
 ```
 
 Downloaded and running are different states on the Mac: weights on disk cost only disk, weights
@@ -253,22 +252,21 @@ getting to the chat screen:
 client.$connectionState
     .sink { state in
         guard state == .connected else { return }
-        Task { try? await client.runModel(nil) }
+        Task { try? await client.runModel(selectedModelID) }
     }
     .store(in: &cancellables)
 ```
 
-The `vision:` form asks the Mac for whichever model it has configured for that capability. The
-`String?` form names one outright — use it when the app lets the user pick a model, so the one
-that gets started is the one the next message will actually use. Passing `nil` falls back to
-the Mac's default.
+Name the model you are about to use, so the one that gets started is the one the next message
+will actually run on. There is no capability shorthand and no `nil` fallback: the Mac keeps no
+default, so `run`/`stop` name an exact model the same way a request does.
 
 A Mac running a build that doesn't know these messages ignores them and answers nothing, so the
 call gives up after three minutes rather than hanging forever. That timeout returns normally —
 it isn't surfaced as an error, since both are optional either way.
 
-`preloadModel(vision:)` and `preloadSpeech()` remain as deprecated aliases. The old name
-suggested a cache warm-up; a model that has been run stays running until stopped.
+`preloadSpeech()` remains as a deprecated alias for `runSpeech()`. The old name suggested a
+cache warm-up; a model that has been run stays running until stopped.
 
 ---
 
@@ -294,9 +292,9 @@ func transcribe(
 
 func converse(
     _ messages: [Message],
+    model: String,                // required — the Mac has no default
     voice: String? = nil,
     tools: [BigBroTool] = [],
-    model: String? = nil,
     options: GenerationOptions? = nil,
     reasoningEffort: ReasoningEffort? = nil
 ) -> AsyncThrowingStream<ConverseEvent, Error>
@@ -304,11 +302,11 @@ func converse(
 // Speech in, speech out — one whole spoken turn.
 func converse(
     audio: Data,
+    model: String,                // required — the Mac has no default
     format: String = "wav",
     history: [Message] = [],
     voice: String? = nil,
     tools: [BigBroTool] = [],
-    model: String? = nil,
     options: GenerationOptions? = nil,
     reasoningEffort: ReasoningEffort? = nil
 ) -> AsyncThrowingStream<ConverseEvent, Error>
@@ -405,7 +403,7 @@ Requires `NSMicrophoneUsageDescription`.
 Listen, transcribe, answer (with tools), speak, repeat — continuously, hands-free.
 
 ```swift
-let session = BigBroVoiceSession(client: client, tools: myTools)
+let session = BigBroVoiceSession(client: client, model: "gpt-oss-20b", tools: myTools)
 await session.start()
 // session.phase, .transcript, .reply, .level, .history are all @Published
 session.stop()

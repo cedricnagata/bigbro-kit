@@ -216,11 +216,13 @@ public final class BigBroClient: ObservableObject {
         }
     }
 
-    /// Send a chat request to the paired Mac, proxied to Ollama's `/api/chat`.
+    /// Send a chat request to the paired Mac.
     ///
     /// - Parameters:
     ///   - messages: Conversation history, including any tool results.
-    ///   - model: Override the Mac's default model for this request.
+    ///   - model: Which model answers. Required — the Mac keeps no default, so a request that
+    ///     names no model is an error rather than a guess. Send a vision-capable model for any
+    ///     conversation carrying images; the Mac will not silently substitute one.
     ///   - streaming: When `true` (default), yields text deltas as they arrive.
     ///   - tools: Tools the model may call; the agentic loop runs transparently.
     ///   - format: Constrain the response to JSON or a specific JSON schema.
@@ -237,7 +239,7 @@ public final class BigBroClient: ObservableObject {
     ///     answer. Ignored unless `think` is `true`.
     public func chat(
         _ messages: [Message],
-        model: String? = nil,
+        model: String,
         streaming: Bool = true,
         tools: [BigBroTool] = [],
         format: ResponseFormat? = nil,
@@ -273,9 +275,9 @@ public final class BigBroClient: ObservableObject {
                             "requestId": requestId,
                             "messages": workingMessages,
                             "streaming": streaming,
+                            "model": model,
                         ]
                         if !encodedTools.isEmpty { msg["tools"] = encodedTools }
-                        if let model     { msg["model"] = model }
                         if let format    { msg["format"] = format.toJSONValue() }
                         if let options   { msg["options"] = options.toDict() }
                         if let think     { msg["think"] = think }
@@ -343,32 +345,34 @@ public final class BigBroClient: ObservableObject {
         }
     }
 
-    /// Send a raw generation request to the paired Mac, proxied to Ollama's `/api/generate`.
+    /// Send a raw single-turn generation request to the paired Mac.
     ///
-    /// Unlike `chat()`, there is no tool-call loop — `/api/generate` does not support tools.
+    /// Unlike `chat()`, there is no tool-call loop.
     ///
     /// - Parameters:
     ///   - prompt: The prompt string to generate a response for.
-    ///   - images: Images to include with the request (multimodal models only).
+    ///   - model: Which model answers. Required — the Mac keeps no default. Must be a
+    ///     vision-capable model whenever `images` is non-empty; the Mac fails the request
+    ///     rather than substituting one that can see.
+    ///   - images: Images to include with the request (vision models only).
     ///   - suffix: Text to append after the model's response.
     ///   - system: Override the system prompt for this request.
     ///   - template: Override the prompt template.
-    ///   - model: Override the Mac's default model for this request.
     ///   - format: Constrain the response to JSON or a specific JSON schema.
-    ///   - options: Low-level Ollama model parameters.
+    ///   - options: Low-level model parameters.
     ///   - raw: When `true`, skip prompt formatting.
     ///   - think: Whether the Mac should forward the model's reasoning tokens.
     ///   - reasoningEffort: How much deliberation the model should spend before answering.
     ///     A budget, not an on/off switch — see `ReasoningEffort`.
-    ///   - keepAlive: How long Ollama should keep the model loaded after the request.
+    ///   - keepAlive: Accepted for wire compatibility; loaded models stay resident regardless.
     ///   - streaming: When `true` (default), yields text deltas as they arrive.
     public func generate(
         prompt: String,
+        model: String,
         images: [Data] = [],
         suffix: String? = nil,
         system: String? = nil,
         template: String? = nil,
-        model: String? = nil,
         format: ResponseFormat? = nil,
         options: GenerationOptions? = nil,
         raw: Bool? = nil,
@@ -393,6 +397,7 @@ public final class BigBroClient: ObservableObject {
                     "requestId": requestId,
                     "prompt": prompt,
                     "streaming": streaming,
+                    "model": model,
                 ]
                 if !images.isEmpty {
                     msg["images"] = images.map { $0.base64EncodedString() }
@@ -400,7 +405,6 @@ public final class BigBroClient: ObservableObject {
                 if let suffix    { msg["suffix"] = suffix }
                 if let system    { msg["system"] = system }
                 if let template  { msg["template"] = template }
-                if let model     { msg["model"] = model }
                 if let format    { msg["format"] = format.toJSONValue() }
                 if let options   { msg["options"] = options.toDict() }
                 if let raw       { msg["raw"] = raw }
@@ -438,22 +442,16 @@ public final class BigBroClient: ObservableObject {
     /// — when the chat screen appears — moves it somewhere it can be shown instead.
     ///
     /// Purely an optimization: safe to skip, and safe to call more than once (starting an
-    /// already-running model is a fast no-op).
+    /// already-running model is a fast no-op). Any number can be running at once; starting one
+    /// never stops another.
     ///
-    /// - Parameter vision: Start the vision-capable model instead of the text one. Both can be
-    ///   running at once; starting one never stops the other.
+    /// - Parameter model: A model id the Mac knows. Required — there is no configured default
+    ///   to start instead.
     /// - Throws: `BigBroError.modelDownloading` if the model isn't downloaded yet on the Mac
     ///   (the download starts either way; watch `modelDownloads` for progress and retry once
-    ///   it completes).
-    public func runModel(vision: Bool = false) async throws {
-        try await sendModelCommand("run", model: vision ? "vision" : "text")
-    }
-
-    /// Starts a specific model by name, for apps that let the user choose one.
-    ///
-    /// - Parameter model: A model id the Mac knows. `nil` starts the Mac's configured default.
-    public func runModel(_ model: String?) async throws {
-        try await sendModelCommand("run", model: model?.isEmpty == false ? model! : "text")
+    ///   it completes). `BigBroError.serverError` if the Mac has no such model.
+    public func runModel(_ model: String) async throws {
+        try await sendModelCommand("run", model: model)
     }
 
     /// Stops a model on the Mac, freeing the memory it was holding.
@@ -466,14 +464,9 @@ public final class BigBroClient: ObservableObject {
     /// Succeeds whether or not the model was running. Note that models are shared across
     /// paired devices, so stopping one takes it away from every device, not just this one.
     ///
-    /// - Parameter model: A model id, or `nil` for the Mac's configured default text model.
-    public func stopModel(_ model: String? = nil) async throws {
-        try await sendModelCommand("stop", model: model?.isEmpty == false ? model! : "text")
-    }
-
-    /// Stops the vision model.
-    public func stopModel(vision: Bool) async throws {
-        try await sendModelCommand("stop", model: vision ? "vision" : "text")
+    /// - Parameter model: A model id the Mac knows. Required, for the same reason as `runModel`.
+    public func stopModel(_ model: String) async throws {
+        try await sendModelCommand("stop", model: model)
     }
 
     /// Starts the speech models — text-to-speech and transcription — on the Mac.
@@ -528,13 +521,6 @@ public final class BigBroClient: ObservableObject {
     private static let modelCommandTimeout: Duration = .seconds(180)
 
     // MARK: - Compatibility
-
-    /// Renamed: a model is *run*, not loaded. `preload` suggested a cache warm-up, but this
-    /// starts a model that then stays running until stopped.
-    @available(*, deprecated, renamed: "runModel(vision:)")
-    public func preloadModel(vision: Bool = false) async throws {
-        try await runModel(vision: vision)
-    }
 
     @available(*, deprecated, renamed: "runSpeech()")
     public func preloadSpeech() async throws {
@@ -667,15 +653,16 @@ public final class BigBroClient: ObservableObject {
     /// - Parameters:
     ///   - audio: A complete recorded utterance. `BigBroMicrophone` produces these already
     ///     endpointed; otherwise record a turn and pass it whole.
+    ///   - model: Which model answers. Required — the Mac keeps no default.
     ///   - format: Container `audio` is in. WAV is what `BigBroMicrophone` emits.
     ///   - history: Conversation so far, not including this turn.
     public func converse(
         audio: Data,
+        model: String,
         format: String = "wav",
         history: [Message] = [],
         voice: String? = nil,
         tools: [BigBroTool] = [],
-        model: String? = nil,
         options: GenerationOptions? = nil,
         reasoningEffort: ReasoningEffort? = nil
     ) -> AsyncThrowingStream<ConverseEvent, Error> {
@@ -693,8 +680,8 @@ public final class BigBroClient: ObservableObject {
                     }
 
                     let messages = history + [.user(spoken)]
-                    for try await event in self.converse(messages, voice: voice, tools: tools,
-                                                         model: model, options: options,
+                    for try await event in self.converse(messages, model: model, voice: voice,
+                                                         tools: tools, options: options,
                                                          reasoningEffort: reasoningEffort) {
                         if Task.isCancelled { break }
                         continuation.yield(event)
@@ -718,11 +705,13 @@ public final class BigBroClient: ObservableObject {
     /// because the tool-calling loop runs here: only the client knows which turn is a final
     /// answer and which is an intermediate tool step, so only the client can decide what is
     /// worth speaking.
+    ///
+    /// - Parameter model: Which model answers. Required — the Mac keeps no default.
     public func converse(
         _ messages: [Message],
+        model: String,
         voice: String? = nil,
         tools: [BigBroTool] = [],
-        model: String? = nil,
         options: GenerationOptions? = nil,
         reasoningEffort: ReasoningEffort? = nil
     ) -> AsyncThrowingStream<ConverseEvent, Error> {
