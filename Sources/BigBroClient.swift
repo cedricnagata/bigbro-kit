@@ -219,6 +219,10 @@ public final class BigBroClient: ObservableObject {
     ///   - think: Whether the Mac should forward the model's reasoning/analysis tokens. The
     ///     model generates them either way; this only controls whether they're sent to you
     ///     (via `onThinking`) or discarded on the Mac. Defaults to on for backward compatibility.
+    ///   - reasoningEffort: How much deliberation the model should spend before answering.
+    ///     Unlike `think`, this changes what the model actually does — `.low` produces a much
+    ///     shorter analysis pass and a faster first answer. Defaults to the model's own
+    ///     default (`.medium` for gpt-oss). See `ReasoningEffort`.
     ///   - keepAlive: How long Ollama should keep the model loaded after the request.
     ///   - onThinking: Called with each reasoning token as it streams in, ahead of the final
     ///     answer. Ignored unless `think` is `true`.
@@ -230,6 +234,7 @@ public final class BigBroClient: ObservableObject {
         format: ResponseFormat? = nil,
         options: GenerationOptions? = nil,
         think: Bool? = nil,
+        reasoningEffort: ReasoningEffort? = nil,
         keepAlive: String? = nil,
         onThinking: (@Sendable (String) -> Void)? = nil
     ) -> AsyncThrowingStream<String, Error> {
@@ -264,6 +269,7 @@ public final class BigBroClient: ObservableObject {
                         if let format    { msg["format"] = format.toJSONValue() }
                         if let options   { msg["options"] = options.toDict() }
                         if let think     { msg["think"] = think }
+                        if let reasoningEffort { msg["reasoning_effort"] = reasoningEffort.rawValue }
                         if let keepAlive { msg["keep_alive"] = keepAlive }
                         try await conn.send(msg)
 
@@ -329,7 +335,9 @@ public final class BigBroClient: ObservableObject {
     ///   - format: Constrain the response to JSON or a specific JSON schema.
     ///   - options: Low-level Ollama model parameters.
     ///   - raw: When `true`, skip prompt formatting.
-    ///   - think: Enable chain-of-thought reasoning.
+    ///   - think: Whether the Mac should forward the model's reasoning tokens.
+    ///   - reasoningEffort: How much deliberation the model should spend before answering.
+    ///     A budget, not an on/off switch — see `ReasoningEffort`.
     ///   - keepAlive: How long Ollama should keep the model loaded after the request.
     ///   - streaming: When `true` (default), yields text deltas as they arrive.
     public func generate(
@@ -343,6 +351,7 @@ public final class BigBroClient: ObservableObject {
         options: GenerationOptions? = nil,
         raw: Bool? = nil,
         think: Bool? = nil,
+        reasoningEffort: ReasoningEffort? = nil,
         keepAlive: String? = nil,
         streaming: Bool = true
     ) -> AsyncThrowingStream<String, Error> {
@@ -374,6 +383,7 @@ public final class BigBroClient: ObservableObject {
                 if let options   { msg["options"] = options.toDict() }
                 if let raw       { msg["raw"] = raw }
                 if let think     { msg["think"] = think }
+                if let reasoningEffort { msg["reasoning_effort"] = reasoningEffort.rawValue }
                 if let keepAlive { msg["keep_alive"] = keepAlive }
                 do {
                     try await conn.send(msg)
@@ -429,9 +439,26 @@ public final class BigBroClient: ObservableObject {
         ]
         print("[BigBroClient] preloadModel: vision=\(vision)")
         try await conn.send(msg)
-        // Preload emits no events of its own — this just waits for done/error.
-        for try await _ in eventStream {}
+
+        // Preload emits no events of its own — this just waits for done/error, or for the
+        // timeout to rule the Mac unable to answer. The timeout is not decoration: a BigBro
+        // build older than the `preload` handler ignores the message and sends back neither
+        // `done` nor `error`, which would strand this task for the life of the connection.
+        // The cap is generous because a cold 20B model genuinely can take this long to
+        // materialize its weights.
+        let wait = Task { for try await _ in eventStream {} }
+        let timeout = Task {
+            try await Task.sleep(for: Self.preloadTimeout)
+            print("[BigBroClient] preloadModel: no response from the Mac, giving up")
+            self.requests.finish(requestId)
+        }
+        defer { timeout.cancel() }
+        try await wait.value
     }
+
+    /// How long to wait for the Mac to acknowledge a preload before giving up. Preload is an
+    /// optimization, so timing out finishes quietly rather than throwing.
+    private static let preloadTimeout: Duration = .seconds(180)
 
     // MARK: - Speech
 
@@ -549,7 +576,8 @@ public final class BigBroClient: ObservableObject {
         voice: String? = nil,
         tools: [BigBroTool] = [],
         model: String? = nil,
-        options: GenerationOptions? = nil
+        options: GenerationOptions? = nil,
+        reasoningEffort: ReasoningEffort? = nil
     ) -> AsyncThrowingStream<ConverseEvent, Error> {
         AsyncThrowingStream { continuation in
             Task {
@@ -572,7 +600,8 @@ public final class BigBroClient: ObservableObject {
 
                 do {
                     var buffer = ""
-                    for try await delta in self.chat(messages, model: model, tools: tools, options: options) {
+                    for try await delta in self.chat(messages, model: model, tools: tools,
+                                                     options: options, reasoningEffort: reasoningEffort) {
                         continuation.yield(.text(delta))
                         buffer += delta
                         while let sentence = Self.takeSentence(&buffer) {

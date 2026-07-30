@@ -160,7 +160,8 @@ func chat(
     tools: [BigBroTool] = [],     // triggers the agentic tool-call loop
     format: ResponseFormat? = nil,
     options: GenerationOptions? = nil,
-    think: Bool? = nil,           // chain-of-thought (supported models only)
+    think: Bool? = nil,                        // forward the reasoning trace to this device
+    reasoningEffort: ReasoningEffort? = nil,   // how hard the model actually thinks
     keepAlive: String? = nil      // how long Ollama keeps the model loaded
 ) -> AsyncThrowingStream<String, Error>
 ```
@@ -179,6 +180,7 @@ func generate(
     options: GenerationOptions? = nil,
     raw: Bool? = nil,
     think: Bool? = nil,
+    reasoningEffort: ReasoningEffort? = nil,
     keepAlive: String? = nil,
     streaming: Bool = true
 ) -> AsyncThrowingStream<String, Error>
@@ -186,10 +188,35 @@ func generate(
 
 `generate()` does not support tools — it is a single-turn completion.
 
-> The Mac proxies to an OpenAI-compatible backend, so `template`, `raw` and `suffix` have no
-> equivalent and return an error rather than being silently ignored. `think` is translated to
-> `reasoning_effort`, and reasoning arrives as a separate `thinking` message so it is never
-> mixed into the answer — or spoken.
+> `template`, `raw` and `suffix` have no equivalent on the Mac's backend and return an error
+> rather than being silently ignored. Reasoning arrives as a separate `thinking` message so it
+> is never mixed into the answer — or spoken.
+
+#### Reasoning: `think` vs `reasoningEffort`
+
+Two different knobs, easy to confuse:
+
+```swift
+public enum ReasoningEffort: String, Sendable, CaseIterable, Codable {
+    case low, medium, high        // .default == .medium
+}
+```
+
+| | What it changes | Effect on latency |
+|---|---|---|
+| `think` | Whether the reasoning trace is **forwarded** to this device (via `onThinking`) or dropped on the Mac | None on its own — the model reasons either way |
+| `reasoningEffort` | How long the model actually **spends reasoning** before answering | Real: `.low` is typically tens of analysis tokens, `.high` hundreds |
+
+There is deliberately no "off". gpt-oss is a Harmony model — it always writes an `analysis`
+channel before its final one, and the only lever its prompt format carries is an effort level,
+rendered into the system message as `Reasoning: <level>`. It was trained on exactly these three
+words; a fourth value would be text the model has never seen, which degrades the answer instead
+of skipping the analysis. `.low` is the closest thing to turning it off.
+
+Passing `think: false` without an explicit effort is treated by the Mac as a request for speed
+and lowers the budget to `low`. Set `reasoningEffort` when you want to say so outright — it
+always wins over that inference, so `think: false` + `.high` means "think hard, just don't show
+me the working".
 
 #### Inference — preload
 
@@ -207,6 +234,22 @@ Purely an optimization: safe to skip, and safe to call more than once. Throws
 `BigBroError.modelDownloading` if the model isn't downloaded yet (the download starts either
 way — watch `modelDownloads` and retry once it completes, or just proceed to `chat()`/`generate()`,
 which will wait on the same download).
+
+A good place to call it is the moment a Mac connects, so the wait overlaps with the user
+getting to the chat screen:
+
+```swift
+client.$connectionState
+    .sink { state in
+        guard state == .connected else { return }
+        Task { try? await client.preloadModel() }
+    }
+    .store(in: &cancellables)
+```
+
+A Mac running a build older than the `preload` message ignores it and answers nothing, so the
+call gives up after three minutes rather than hanging forever. That timeout returns normally —
+it isn't surfaced as an error, since preloading is optional either way.
 
 ---
 
@@ -484,8 +527,8 @@ BigBroKit communicates with the Mac over TCP on port 8765. Each message is a 4-b
 | iOS → Mac | Fields | Purpose |
 |---|---|---|
 | `hello` | `deviceId`, `deviceName`, `appName`, `requiredModels?` | Initiate pairing |
-| `request` | `requestId`, `messages`, `streaming`, `tools?`, `model?`, … | Chat inference |
-| `generateRequest` | `requestId`, `prompt`, `streaming`, `images?`, … | Generate inference |
+| `request` | `requestId`, `messages`, `streaming`, `tools?`, `model?`, `think?`, `reasoning_effort?`, … | Chat inference |
+| `generateRequest` | `requestId`, `prompt`, `streaming`, `images?`, `think?`, `reasoning_effort?`, … | Generate inference |
 | `speechRequest` | `requestId`, `input`, `voice?`, `model?`, `response_format?`, `speed?` | Text to speech |
 | `transcribeRequest` | `requestId`, `audio` (base64), `audioFormat?`, `model?`, `language?` | Speech to text |
 | `preload` | `requestId`, `model?` (`"text"` / `"vision"`) | Load a model into memory ahead of the first message |

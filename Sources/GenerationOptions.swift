@@ -62,6 +62,33 @@ public struct GenerationOptions: Sendable {
     }
 }
 
+/// How much deliberation a reasoning model should spend before answering.
+///
+/// This is a *budget*, not a switch. gpt-oss is a Harmony model: it always writes to an
+/// analysis channel before its final one, and the only lever its prompt format carries is an
+/// effort level, rendered literally into the system message as `Reasoning: <level>`. It was
+/// trained on exactly these three words — there is no fourth value meaning "off", and
+/// inventing one puts text in the prompt the model has never seen, which degrades the answer
+/// instead of skipping the analysis. `.low` is the closest thing to turning it off, typically
+/// tens of analysis tokens rather than hundreds.
+///
+/// Distinct from `think:` on `chat()` and `generate()`, which decides whether the reasoning
+/// the model produces is *forwarded* to this device or dropped on the Mac. Turning `think`
+/// off hides the trace; it does not make the model skip it.
+///
+/// The two do interact at one point: when no effort is named, the Mac reads `think: false` as
+/// a request for speed and drops the budget to `.low` on the caller's behalf. Setting this
+/// explicitly overrides that, so `think: false` with `.high` means "think hard, just don't
+/// show me the working".
+public enum ReasoningEffort: String, Sendable, CaseIterable, Codable {
+    case low
+    case medium
+    case high
+
+    /// What gpt-oss assumes when nothing is specified.
+    public static let `default`: ReasoningEffort = .medium
+}
+
 /// Constrains the response — either plain JSON mode or a structured JSON schema.
 ///
 /// For `jsonSchema`, serialize your schema dict to `Data` before passing:
