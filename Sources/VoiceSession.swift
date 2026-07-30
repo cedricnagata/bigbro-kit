@@ -135,7 +135,7 @@ public final class BigBroVoiceSession: ObservableObject {
 
         phase = .preparing
         do {
-            try await client.preloadSpeech()
+            try await client.runSpeech()
         } catch {
             // Not fatal on its own — the first turn will simply be slower, or will fail with
             // a clearer error of its own. Speech being switched off on the Mac lands here.

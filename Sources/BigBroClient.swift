@@ -423,75 +423,119 @@ public final class BigBroClient: ObservableObject {
         }
     }
 
-    /// Loads a model into memory on the Mac ahead of time, without generating anything.
+    /// Starts a model on the Mac — materializes its weights into memory — without generating
+    /// anything.
     ///
-    /// BigBro only pays the cost of materializing a model's weights into memory the first
-    /// time a request actually needs it — for a large model that can be several seconds,
-    /// landing on whatever the user's first message happens to be. Calling this when a chat
-    /// session is likely to start soon (e.g. when the chat screen appears) moves that cost
-    /// earlier, so it doesn't show up as latency on the first real message.
+    /// A model can be downloaded but not running: the weights sit on disk costing nothing
+    /// until something needs them, and turning them into a usable model takes seconds for a
+    /// large one. BigBro does that lazily, so without this the cost lands on whatever the
+    /// user's first message happens to be. Calling this when a session is likely to start soon
+    /// — when the chat screen appears — moves it somewhere it can be shown instead.
     ///
-    /// Purely an optimization — safe to skip, and safe to call more than once (loading an
-    /// already-loaded model is a fast no-op on the Mac).
+    /// Purely an optimization: safe to skip, and safe to call more than once (starting an
+    /// already-running model is a fast no-op).
     ///
-    /// - Parameter vision: Preload the vision-capable model instead of the text model. Pick
-    ///   whichever the session is more likely to need first; either loads independently and
-    ///   both can be resident on the Mac at once.
+    /// - Parameter vision: Start the vision-capable model instead of the text one. Both can be
+    ///   running at once; starting one never stops the other.
     /// - Throws: `BigBroError.modelDownloading` if the model isn't downloaded yet on the Mac
     ///   (the download starts either way; watch `modelDownloads` for progress and retry once
     ///   it completes).
-    public func preloadModel(vision: Bool = false) async throws {
-        try await preload(model: vision ? "vision" : "text")
+    public func runModel(vision: Bool = false) async throws {
+        try await sendModelCommand("run", model: vision ? "vision" : "text")
     }
 
-    /// Loads the speech models — text-to-speech and transcription — into memory on the Mac.
+    /// Starts a specific model by name, for apps that let the user choose one.
     ///
-    /// Matters more for a voice loop than the chat preload does. The Mac warms these at launch
-    /// when speech is enabled, but a device that connects while that is still running would
-    /// otherwise pay the remainder on the user's first spoken words, which is exactly the
-    /// moment a hands-free loop looks broken. Awaiting this before starting a session moves
-    /// the wait somewhere it can be shown.
+    /// - Parameter model: A model id the Mac knows. `nil` starts the Mac's configured default.
+    public func runModel(_ model: String?) async throws {
+        try await sendModelCommand("run", model: model?.isEmpty == false ? model! : "text")
+    }
+
+    /// Stops a model on the Mac, freeing the memory it was holding.
+    ///
+    /// The download is kept — this is the opposite of `runModel`, not a delete. Starting it
+    /// again skips straight to loading the weights already on disk. Removing a download is
+    /// deliberately not something a client can do: it is destructive and belongs to whoever
+    /// owns the Mac, in BigBro's own Settings.
+    ///
+    /// Succeeds whether or not the model was running. Note that models are shared across
+    /// paired devices, so stopping one takes it away from every device, not just this one.
+    ///
+    /// - Parameter model: A model id, or `nil` for the Mac's configured default text model.
+    public func stopModel(_ model: String? = nil) async throws {
+        try await sendModelCommand("stop", model: model?.isEmpty == false ? model! : "text")
+    }
+
+    /// Stops the vision model.
+    public func stopModel(vision: Bool) async throws {
+        try await sendModelCommand("stop", model: vision ? "vision" : "text")
+    }
+
+    /// Starts the speech models — text-to-speech and transcription — on the Mac.
+    ///
+    /// Matters more for a voice loop than the chat equivalent does. The Mac starts these at
+    /// launch when speech is enabled, but a device that connects while that is still running
+    /// would otherwise pay the remainder on the user's first spoken words, which is exactly
+    /// the moment a hands-free loop looks broken. Awaiting this before starting a session
+    /// moves the wait somewhere it can be shown.
+    ///
+    /// There is no matching stop: the speech models are shared by every paired device and
+    /// reload slowly, so letting one client evict them for everyone isn't a trade worth
+    /// offering.
     ///
     /// - Throws: `BigBroError.serverError` if speech is switched off on the Mac.
-    public func preloadSpeech() async throws {
-        try await preload(model: "speech")
+    public func runSpeech() async throws {
+        try await sendModelCommand("run", model: "speech")
     }
 
-    private func preload(model: String) async throws {
+    private func sendModelCommand(_ type: String, model: String) async throws {
         guard let conn = peerConnection else {
-            print("[BigBroClient] preload: not paired")
+            print("[BigBroClient] \(type): not paired")
             throw BigBroError.notPaired
         }
         let requestId = UUID().uuidString
         let eventStream = AsyncThrowingStream<PeerEvent, Error> { cont in
             self.requests.register(requestId, cont)
         }
-        print("[BigBroClient] preload: \(model)")
+        print("[BigBroClient] \(type): \(model)")
         try await conn.send([
-            "type": "preload",
+            "type": type,
             "requestId": requestId,
             "model": model,
         ])
 
-        // Preload emits no events of its own — this just waits for done/error, or for the
+        // These emit no events of their own — this just waits for done/error, or for the
         // timeout to rule the Mac unable to answer. The timeout is not decoration: a BigBro
-        // build older than the `preload` handler ignores the message and sends back neither
-        // `done` nor `error`, which would strand this task for the life of the connection.
-        // The cap is generous because a cold 20B model genuinely can take this long to
-        // materialize its weights.
+        // build that doesn't know the message ignores it and sends back neither `done` nor
+        // `error`, which would strand this task for the life of the connection. The cap is
+        // generous because a cold 20B model genuinely can take this long to start.
         let wait = Task { for try await _ in eventStream {} }
         let timeout = Task {
-            try await Task.sleep(for: Self.preloadTimeout)
-            print("[BigBroClient] preload: no response from the Mac, giving up")
+            try await Task.sleep(for: Self.modelCommandTimeout)
+            print("[BigBroClient] \(type): no response from the Mac, giving up")
             self.requests.finish(requestId)
         }
         defer { timeout.cancel() }
         try await wait.value
     }
 
-    /// How long to wait for the Mac to acknowledge a preload before giving up. Preload is an
-    /// optimization, so timing out finishes quietly rather than throwing.
-    private static let preloadTimeout: Duration = .seconds(180)
+    /// How long to wait for the Mac to acknowledge a run/stop before giving up. Both are
+    /// optimizations, so timing out finishes quietly rather than throwing.
+    private static let modelCommandTimeout: Duration = .seconds(180)
+
+    // MARK: - Compatibility
+
+    /// Renamed: a model is *run*, not loaded. `preload` suggested a cache warm-up, but this
+    /// starts a model that then stays running until stopped.
+    @available(*, deprecated, renamed: "runModel(vision:)")
+    public func preloadModel(vision: Bool = false) async throws {
+        try await runModel(vision: vision)
+    }
+
+    @available(*, deprecated, renamed: "runSpeech()")
+    public func preloadSpeech() async throws {
+        try await runSpeech()
+    }
 
     // MARK: - Speech
 
