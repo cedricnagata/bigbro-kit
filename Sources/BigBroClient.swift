@@ -109,6 +109,11 @@ public final class BigBroClient: ObservableObject {
     /// Convenience accessor; true only when fully connected (not reconnecting).
     public var isConnected: Bool { connectionState == .connected }
 
+    /// Kokoro voice used by `speak`/`converse` when no `voice` is given. Voice selection is
+    /// entirely a BigBroKit concern — the Mac has no configurable default of its own, so a
+    /// caller that wants a specific voice always names it, and one that doesn't gets this.
+    public static let defaultVoice = "af_heart"
+
     private let browser = BonjourBrowser()
     private let continuousBrowser = ContinuousBonjourBrowser()
     private let pairedStore = PairedDeviceStore()
@@ -473,17 +478,16 @@ public final class BigBroClient: ObservableObject {
 
     /// Starts the speech models — text-to-speech and transcription — on the Mac.
     ///
-    /// Matters more for a voice loop than the chat equivalent does. The Mac starts these at
-    /// launch when speech is enabled, but a device that connects while that is still running
-    /// would otherwise pay the remainder on the user's first spoken words, which is exactly
-    /// the moment a hands-free loop looks broken. Awaiting this before starting a session
-    /// moves the wait somewhere it can be shown.
+    /// Matters more for a voice loop than the chat equivalent does. The Mac loads these lazily,
+    /// on whichever `speechRequest`/`transcribeRequest` happens to be first, same as a language
+    /// model starts on whichever chat request is first. A device that connects and immediately
+    /// starts a voice session would otherwise pay that cold-load cost on the user's first
+    /// spoken words, which is exactly the moment a hands-free loop looks broken. Awaiting this
+    /// before starting a session moves the wait somewhere it can be shown.
     ///
-    /// There is no matching stop: the speech models are shared by every paired device and
-    /// reload slowly, so letting one client evict them for everyone isn't a trade worth
-    /// offering.
-    ///
-    /// - Throws: `BigBroError.serverError` if speech is switched off on the Mac.
+    /// There is no matching stop from a client: the speech models are shared by every paired
+    /// device and reload slowly, so letting one client evict them for everyone isn't a trade
+    /// worth offering. Whoever owns the Mac can still stop or remove them locally, in Settings.
     public func runSpeech() async throws {
         try await sendModelCommand("run", model: "speech")
     }
@@ -546,6 +550,10 @@ public final class BigBroClient: ObservableObject {
     /// feed them straight to `AVAudioPlayerNode`.
     ///
     /// Independently useful: speaking a canned string costs no LLM call.
+    ///
+    /// - Parameter voice: Kokoro voice id, e.g. `af_heart`, `am_adam`, `bf_emma`. `nil` or empty
+    ///   uses ``defaultVoice``. There is no Mac-side default to fall back to — voice selection
+    ///   is a client concern end to end.
     public func speak(
         _ text: String,
         voice: String? = nil,
@@ -567,8 +575,8 @@ public final class BigBroClient: ObservableObject {
                     "type": "speechRequest",
                     "requestId": requestId,
                     "input": text,
+                    "voice": (voice?.isEmpty == false) ? voice! : Self.defaultVoice,
                 ]
-                if let voice          { msg["voice"] = voice }
                 if let model          { msg["model"] = model }
                 if let responseFormat { msg["response_format"] = responseFormat }
                 if let speed          { msg["speed"] = speed }

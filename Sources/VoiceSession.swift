@@ -52,7 +52,7 @@ public final class BigBroVoiceSession: ObservableObject {
     /// Tools the model may call. The loop runs inside `converse`, so a tool call costs no
     /// extra round trip to this device.
     public var tools: [BigBroTool]
-    /// Kokoro voice for the answer. `nil` uses the Mac's configured default.
+    /// Kokoro voice for the answer. `nil` uses `BigBroClient.defaultVoice`.
     public var voice: String?
     /// Model to answer with. `nil` uses the Mac's configured default. A model that can't call
     /// tools still answers — the Mac drops them and says so.
@@ -138,7 +138,7 @@ public final class BigBroVoiceSession: ObservableObject {
             try await client.runSpeech()
         } catch {
             // Not fatal on its own — the first turn will simply be slower, or will fail with
-            // a clearer error of its own. Speech being switched off on the Mac lands here.
+            // a clearer error of its own.
             print("[BigBroVoiceSession] speech preload skipped: \(error.localizedDescription)")
         }
 
@@ -209,7 +209,10 @@ public final class BigBroVoiceSession: ObservableObject {
     }
 
     private func runTurn(_ audio: Data) async {
-        let turn = Task { [weak self] in await self?.performTurn(audio) }
+        let turn = Task { [weak self] in
+            guard let self else { return }
+            await self.performTurn(audio)
+        }
         turnTask = turn
         await turn.value
         turnTask = nil
