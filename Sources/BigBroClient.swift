@@ -707,13 +707,21 @@ public final class BigBroClient: ObservableObject {
     /// worth speaking.
     ///
     /// - Parameter model: Which model answers. Required — the Mac keeps no default.
+    /// - Parameters:
+    ///   - think: Whether the model's reasoning is forwarded. Reasoning is never spoken —
+    ///     it reaches `onThinking`, never the sentence buffer — so this only decides whether
+    ///     the caller can display it.
+    ///   - onThinking: Reasoning deltas, for callers that show a trace. Parity with `chat`,
+    ///     so a caller can pipeline speech without giving up anything it had.
     public func converse(
         _ messages: [Message],
         model: String,
         voice: String? = nil,
         tools: [BigBroTool] = [],
         options: GenerationOptions? = nil,
-        reasoningEffort: ReasoningEffort? = nil
+        think: Bool? = nil,
+        reasoningEffort: ReasoningEffort? = nil,
+        onThinking: (@Sendable (String) -> Void)? = nil
     ) -> AsyncThrowingStream<ConverseEvent, Error> {
         AsyncThrowingStream { continuation in
             let work = Task {
@@ -738,7 +746,9 @@ public final class BigBroClient: ObservableObject {
                 do {
                     var buffer = ""
                     for try await delta in self.chat(messages, model: model, tools: tools,
-                                                     options: options, reasoningEffort: reasoningEffort) {
+                                                     options: options, think: think,
+                                                     reasoningEffort: reasoningEffort,
+                                                     onThinking: onThinking) {
                         if Task.isCancelled { break }
                         continuation.yield(.text(delta))
                         buffer += delta
