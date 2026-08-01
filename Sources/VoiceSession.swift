@@ -260,6 +260,10 @@ public final class BigBroVoiceSession: ObservableObject {
                 case .audio(let chunk):
                     if phase != .speaking { phase = .speaking }
                     audioIn.yield(chunk)
+                case .speechFailed(let message):
+                    // The turn still happened and the answer still stands; only the
+                    // voice failed. Surfaced without ending the session.
+                    self.error = message
                 }
             }
         } catch {

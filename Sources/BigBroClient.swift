@@ -634,6 +634,12 @@ public final class BigBroClient: ObservableObject {
         case transcript(String)
         case text(String)
         case audio(Data)
+        /// Synthesis failed. The answer is unaffected and keeps streaming.
+        ///
+        /// A separate case rather than an error on the stream: by the time speech can
+        /// fail the reply is already generated and on screen, and failing the stream
+        /// would throw that away to report that a voice did not work.
+        case speechFailed(String)
     }
 
     /// One spoken turn, end to end: transcribe what was said, answer it, speak the answer.
@@ -737,7 +743,10 @@ public final class BigBroClient: ObservableObject {
                                 continuation.yield(.audio(audio))
                             }
                         } catch {
-                            continuation.finish(throwing: error)
+                            // Reported, not thrown. The answer is the product here; losing
+                            // it because a sentence would not synthesize is a bad trade, and
+                            // the caller can surface this alongside the text it already has.
+                            continuation.yield(.speechFailed(error.localizedDescription))
                             return
                         }
                     }
@@ -803,6 +812,12 @@ public final class BigBroClient: ObservableObject {
     /// Prepares text for synthesis, or returns nil when nothing is left worth speaking.
     ///
     /// Code fences, link targets, bare URLs and table pipes are all noise read aloud.
+    ///
+    /// The final check is the important one: a sentence has to contain a letter or a number
+    /// to be worth sending. Streaming splits an answer into sentences, and a markdown rule
+    /// (`--------------`), a table separator (`|---|---|`) or a lone bullet arrives as a
+    /// "sentence" of its own. None of those are speech, and the Mac answers a request to
+    /// synthesize them with an error rather than silence.
     private static func speakable(_ text: String) -> String? {
         var out = text
         let substitutions: [(pattern: String, replacement: String)] = [
@@ -810,6 +825,9 @@ public final class BigBroClient: ObservableObject {
             ("`([^`]*)`", "$1"),                        // inline code
             ("\\[([^\\]]*)\\]\\([^)]*\\)", "$1"),       // links: keep the label
             ("https?://\\S+", " "),                     // bare URLs
+            // Rules and separators: three or more of them in a row is decoration, never a
+            // word. Single hyphens are left alone so "well-known" survives intact.
+            ("[-=_+*•·—–]{3,}", " "),
             ("[*_#>|~]", " "),                          // emphasis, headings, table pipes
             ("\\s+", " "),
         ]
@@ -817,7 +835,8 @@ public final class BigBroClient: ObservableObject {
             out = out.replacingOccurrences(of: pattern, with: replacement, options: .regularExpression)
         }
         out = out.trimmingCharacters(in: .whitespacesAndNewlines)
-        return out.isEmpty ? nil : out
+        guard out.contains(where: { $0.isLetter || $0.isNumber }) else { return nil }
+        return out
     }
 
     public func disconnect() {
