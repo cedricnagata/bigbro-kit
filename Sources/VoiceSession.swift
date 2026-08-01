@@ -168,6 +168,15 @@ public final class BigBroVoiceSession: ObservableObject {
         didBargeIn = false
     }
 
+    /// Stops the current spoken reply without ending the turn or the session.
+    ///
+    /// For a caller that turns speech off mid-answer: the answer keeps streaming to the
+    /// screen, and the loop returns to listening as it would have anyway.
+    public func stopSpeaking() {
+        player.stop()
+        if phase == .speaking { phase = .listening }
+    }
+
     /// Forgets the conversation, keeping the system prompt. The session can keep running.
     public func resetConversation() {
         history = systemPrompt.map { [.system($0)] } ?? []

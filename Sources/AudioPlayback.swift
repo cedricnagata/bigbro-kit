@@ -123,6 +123,18 @@ public final class BigBroAudioPlayer {
             }
         }
 
+        // Whether the audio is loud enough is decided entirely by the route and the
+        // volume that goes with it, and neither is visible from the code that scheduled
+        // the buffers. Logged once per playback so a "it's too quiet" report carries the
+        // two facts that identify the cause: `Receiver` means it is playing out of the
+        // earpiece, and a low `volume` on `.playAndRecord` means it is being governed by
+        // the call volume rather than the media one.
+        let session = AVAudioSession.sharedInstance()
+        let outputs = session.currentRoute.outputs.map(\.portType.rawValue).joined(separator: ",")
+        print("[BigBroAudioPlayer] route=\(outputs.isEmpty ? "none" : outputs) "
+              + "category=\(session.category.rawValue) mode=\(session.mode.rawValue) "
+              + "volume=\(String(format: "%.2f", session.outputVolume))")
+
         if !isAttached {
             engine.attach(node)
             engine.connect(node, to: engine.mainMixerNode, format: format)
