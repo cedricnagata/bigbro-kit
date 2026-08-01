@@ -63,6 +63,13 @@ public final class BigBroVoiceSession: ObservableObject {
     /// interrupting itself.
     public var allowsBargeIn: Bool
 
+    /// Whether replies are spoken aloud.
+    ///
+    /// `false` keeps the hands-free loop — talk to it, watch the answer stream in — without
+    /// synthesizing anything. The turn ends at `.listening` rather than `.speaking`, and
+    /// barge-in becomes moot because there is nothing to interrupt.
+    public var speaksReplies: Bool
+
     private let client: BigBroClient
     private let microphone: BigBroMicrophone
     private let player: BigBroAudioPlayer
@@ -80,6 +87,7 @@ public final class BigBroVoiceSession: ObservableObject {
         reasoningEffort: ReasoningEffort? = nil,
         systemPrompt: String? = nil,
         allowsBargeIn: Bool = true,
+        speaksReplies: Bool = true,
         tuning: BigBroMicrophone.Tuning = BigBroMicrophone.Tuning()
     ) {
         self.client = client
@@ -89,6 +97,7 @@ public final class BigBroVoiceSession: ObservableObject {
         self.reasoningEffort = reasoningEffort
         self.systemPrompt = systemPrompt
         self.allowsBargeIn = allowsBargeIn
+        self.speaksReplies = speaksReplies
         // Both are told not to touch the audio session: capture needs `.playAndRecord` and
         // playback would set `.playback`, and whichever ran last would win — silencing the
         // microphone or routing the answer to the earpiece. This type owns the session for both.
@@ -246,7 +255,8 @@ public final class BigBroVoiceSession: ObservableObject {
                 history: history,
                 voice: voice,
                 tools: tools,
-                reasoningEffort: reasoningEffort
+                reasoningEffort: reasoningEffort,
+                speaks: speaksReplies
             ) {
                 if Task.isCancelled { break }
                 switch event {
@@ -309,5 +319,10 @@ public final class BigBroVoiceSession: ObservableObject {
         try session.setCategory(.playAndRecord, mode: .videoChat,
                                 options: [.defaultToSpeaker, .allowBluetooth])
         try session.setActive(true)
+        // `.defaultToSpeaker` only sets the *default* route, and it is given up whenever the
+        // route is re-evaluated — which `.playAndRecord` does when the session activates and
+        // whenever a device is plugged in. Forcing the port keeps playback on the main
+        // speaker rather than dropping to the receiver, where it is barely audible.
+        try? session.overrideOutputAudioPort(.speaker)
     }
 }

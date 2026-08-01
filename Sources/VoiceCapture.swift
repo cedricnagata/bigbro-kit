@@ -143,6 +143,9 @@ public final class BigBroMicrophone: ObservableObject {
                 try session.setCategory(.playAndRecord, mode: .videoChat,
                                         options: [.defaultToSpeaker, .allowBluetooth])
                 try session.setActive(true)
+                // `.defaultToSpeaker` is only a default and is given up when the route is
+                // re-evaluated; forcing the port keeps playback off the receiver.
+                try? session.overrideOutputAudioPort(.speaker)
             } catch {
                 throw CaptureError.engineFailed(error.localizedDescription)
             }

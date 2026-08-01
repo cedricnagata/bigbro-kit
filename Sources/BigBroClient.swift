@@ -670,7 +670,8 @@ public final class BigBroClient: ObservableObject {
         voice: String? = nil,
         tools: [BigBroTool] = [],
         options: GenerationOptions? = nil,
-        reasoningEffort: ReasoningEffort? = nil
+        reasoningEffort: ReasoningEffort? = nil,
+        speaks: Bool = true
     ) -> AsyncThrowingStream<ConverseEvent, Error> {
         AsyncThrowingStream { continuation in
             let work = Task {
@@ -688,7 +689,8 @@ public final class BigBroClient: ObservableObject {
                     let messages = history + [.user(spoken)]
                     for try await event in self.converse(messages, model: model, voice: voice,
                                                          tools: tools, options: options,
-                                                         reasoningEffort: reasoningEffort) {
+                                                         reasoningEffort: reasoningEffort,
+                                                         speaks: speaks) {
                         if Task.isCancelled { break }
                         continuation.yield(event)
                     }
@@ -727,6 +729,7 @@ public final class BigBroClient: ObservableObject {
         options: GenerationOptions? = nil,
         think: Bool? = nil,
         reasoningEffort: ReasoningEffort? = nil,
+        speaks: Bool = true,
         onThinking: (@Sendable (String) -> Void)? = nil
     ) -> AsyncThrowingStream<ConverseEvent, Error> {
         AsyncThrowingStream { continuation in
@@ -762,7 +765,9 @@ public final class BigBroClient: ObservableObject {
                         continuation.yield(.text(delta))
                         buffer += delta
                         while let sentence = Self.takeSentence(&buffer) {
-                            if let speakable = Self.speakable(sentence) { enqueue.yield(speakable) }
+                            if speaks, let speakable = Self.speakable(sentence) {
+                                enqueue.yield(speakable)
+                            }
                         }
                     }
                     // An interrupted answer must not keep speaking. Anything already queued is
@@ -773,7 +778,7 @@ public final class BigBroClient: ObservableObject {
                         continuation.finish()
                         return
                     }
-                    if let speakable = Self.speakable(buffer) { enqueue.yield(speakable) }
+                    if speaks, let speakable = Self.speakable(buffer) { enqueue.yield(speakable) }
                     enqueue.finish()
                     await speaker.value
                     continuation.finish()
