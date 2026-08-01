@@ -135,10 +135,12 @@ public final class BigBroMicrophone: ObservableObject {
         if configuresAudioSession {
             do {
                 let session = AVAudioSession.sharedInstance()
-                // `.voiceChat` is what turns on the system's echo canceller. Without it the
+                // A chat mode is what turns on the system's echo canceller. Without it the
                 // mic hears the assistant's own reply and the endpointer treats it as the
-                // user talking, which makes the loop converse with itself.
-                try session.setCategory(.playAndRecord, mode: .voiceChat,
+                // user talking, which makes the loop converse with itself. `.videoChat`
+                // rather than `.voiceChat` — see VoiceSession: the latter binds playback to
+                // call volume and the ring switch, leaving a muted ringer nearly silent.
+                try session.setCategory(.playAndRecord, mode: .videoChat,
                                         options: [.defaultToSpeaker, .allowBluetooth])
                 try session.setActive(true)
             } catch {

@@ -296,12 +296,17 @@ public final class BigBroVoiceSession: ObservableObject {
 
     /// One session for both directions, configured once here.
     ///
-    /// `.voiceChat` is the load-bearing part: it enables the system echo canceller, without
+    /// A chat mode is the load-bearing part: it enables the system echo canceller, without
     /// which the microphone hears the assistant's own answer, the endpointer reads it as the
     /// user talking, and the loop interrupts itself in a cycle that never settles.
     private func configureAudioSession() throws {
         let session = AVAudioSession.sharedInstance()
-        try session.setCategory(.playAndRecord, mode: .voiceChat,
+        // `.videoChat`, not `.voiceChat`. Both give the echo cancellation barge-in needs,
+        // but `.voiceChat` tells iOS this is a phone call: playback is then governed by the
+        // call volume and follows the ring/silent switch, so a muted ringer makes the
+        // assistant almost inaudible. `.videoChat` keeps the cancellation and plays through
+        // the main speaker at media levels.
+        try session.setCategory(.playAndRecord, mode: .videoChat,
                                 options: [.defaultToSpeaker, .allowBluetooth])
         try session.setActive(true)
     }
