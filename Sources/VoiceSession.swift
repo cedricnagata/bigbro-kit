@@ -189,6 +189,12 @@ public final class BigBroVoiceSession: ObservableObject {
     // MARK: - Loop
 
     private func runLoop() async {
+        // Announced before the first utterance, not after the first completed turn.
+        // `utterances()` only yields once the user has actually said something, so
+        // reporting `.listening` from inside the loop left the session showing
+        // "Getting ready…" for as long as the room stayed quiet — which reads as a
+        // session that never started rather than one waiting to be spoken to.
+        phase = .listening
         do {
             for try await utterance in microphone.utterances() {
                 if Task.isCancelled { return }
