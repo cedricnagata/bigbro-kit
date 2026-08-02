@@ -730,6 +730,7 @@ public final class BigBroClient: ObservableObject {
         think: Bool? = nil,
         reasoningEffort: ReasoningEffort? = nil,
         speaks: Bool = true,
+        streaming: Bool = true,
         onThinking: (@Sendable (String) -> Void)? = nil
     ) -> AsyncThrowingStream<ConverseEvent, Error> {
         AsyncThrowingStream { continuation in
@@ -757,14 +758,19 @@ public final class BigBroClient: ObservableObject {
 
                 do {
                     var buffer = ""
-                    for try await delta in self.chat(messages, model: model, tools: tools,
+                    for try await delta in self.chat(messages, model: model,
+                                                     streaming: streaming, tools: tools,
                                                      options: options, think: think,
                                                      reasoningEffort: reasoningEffort,
                                                      onThinking: onThinking) {
                         if Task.isCancelled { break }
                         continuation.yield(.text(delta))
                         buffer += delta
-                        while let sentence = Self.takeSentence(&buffer) {
+                        // Sentence-at-a-time is the streaming behaviour. Asked for a single
+                        // response, the whole answer is spoken as one utterance below —
+                        // splitting it anyway would stream the speech while the text did
+                        // not, which is not what "single response" means.
+                        while streaming, let sentence = Self.takeSentence(&buffer) {
                             if speaks, let speakable = Self.speakable(sentence) {
                                 enqueue.yield(speakable)
                             }
