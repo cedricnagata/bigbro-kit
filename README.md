@@ -417,11 +417,22 @@ that cancellation propagates, so the Mac stops generating rather than finishing 
 nobody will hear. The interrupted turn is still committed to history, partial answer included,
 so a follow-up like "sorry, go on" has something to refer to.
 
-The session sets `.playAndRecord` with mode `.videoChat`, which is what enables the system
-echo canceller. Without it the microphone hears the assistant's own voice, the endpointer
-reads that as the user talking, and the loop interrupts itself in a cycle that never settles.
-If echo cancellation is failing on some device, `allowsBargeIn = false` makes the loop
-half-duplex instead of letting it argue with itself.
+The session sets `.playAndRecord` with mode `.videoChat` **and** calls
+`setVoiceProcessingEnabled(true)` on one engine shared by capture and playback. Both halves
+are load-bearing, and the second is easy to miss: per Apple, an app that sets a chat mode
+without using voice processing gets *less* processing, not more — no echo cancellation, no
+automatic gain correction, and dynamic processing disabled on input and output, "which results
+in a lower playback level". The mode alone buys a quiet, deaf session.
+
+The shared engine is required for the same reason. Voice processing lives in one I/O unit and
+sees only the streams inside its own engine, so capture in one and playback in another leaves
+it no reference signal to cancel against. `BigBroMicrophone` and `BigBroAudioPlayer` each take
+an optional `engine:` for this; pass one instance to both if you compose them yourself.
+
+Echo cancellation is what makes barge-in possible: without it the microphone hears the
+assistant's own voice, the endpointer reads that as the user talking, and the loop interrupts
+itself in a cycle that never settles. If it still fails on some device, `allowsBargeIn = false`
+makes the loop half-duplex instead of letting it argue with itself.
 
 `setHistory(_:)` adopts an existing conversation, so switching from typing to voice continues
 it rather than starting over.

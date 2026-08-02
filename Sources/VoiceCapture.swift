@@ -62,10 +62,11 @@ public final class BigBroMicrophone: ObservableObject {
         /// Floor under the adaptive threshold, so near-silence can't drive it to zero and make
         /// every faint rustle read as speech.
         ///
-        /// A chat-mode session runs the microphone through noise suppression and automatic
-        /// gain control before any of this sees it, and what arrives is a good deal quieter
-        /// than the raw capture — which is why this sits well below where untreated speech
-        /// would need it to be.
+        /// Deliberately low. How loud speech arrives here depends on whether voice processing
+        /// is running: with it, automatic gain correction normalizes the input upward, and
+        /// without it the system actively reduces the processing applied to a chat-mode
+        /// session and delivers something much quieter. This has to clear the quiet case,
+        /// and the cost of it being low in the loud one is a false trigger.
         public var minimumSpeechLevel: Float = 0.005
         /// Ceiling on the adaptive threshold, whatever the room tone measures.
         ///
@@ -97,19 +98,36 @@ public final class BigBroMicrophone: ObservableObject {
         set { detector.tuning = newValue }
     }
 
-    private let engine = AVAudioEngine()
+    private let engine: AVAudioEngine
+    /// False when the engine was handed in, in which case stopping is somebody else's call.
+    private let ownsEngine: Bool
     private let detector: UtteranceDetector
     private let configuresAudioSession: Bool
     private var continuation: AsyncThrowingStream<Data, Error>.Continuation?
     private var stateTask: Task<Void, Never>?
     private var configurationObserver: NSObjectProtocol?
 
-    /// - Parameter configuresAudioSession: Leave `true` for apps with no audio session of
-    ///   their own. `BigBroVoiceSession` sets it `false` and configures the session itself,
-    ///   because capture and playback have to agree on one category to run at the same time.
-    public init(tuning: Tuning = Tuning(), configuresAudioSession: Bool = true) {
+    /// - Parameters:
+    ///   - configuresAudioSession: Leave `true` for apps with no audio session of their own.
+    ///     `BigBroVoiceSession` sets it `false` and configures the session itself, because
+    ///     capture and playback have to agree on one category to run at the same time.
+    ///   - engine: An engine to capture through, instead of a private one.
+    ///
+    ///     Pass the same engine here and to `BigBroAudioPlayer` when both run at once and the
+    ///     microphone must not hear the speaker. Echo cancellation is a property of one I/O
+    ///     unit, which sees only the streams inside its own engine — capture in one engine and
+    ///     playback in another gives it nothing to cancel against, and costs the dynamic
+    ///     processing that makes playback loud. `BigBroVoiceSession` shares an engine for
+    ///     exactly this reason.
+    public init(
+        tuning: Tuning = Tuning(),
+        configuresAudioSession: Bool = true,
+        engine: AVAudioEngine? = nil
+    ) {
         self.detector = UtteranceDetector(tuning: tuning)
         self.configuresAudioSession = configuresAudioSession
+        self.engine = engine ?? AVAudioEngine()
+        self.ownsEngine = engine == nil
     }
 
     // MARK: - Capture
@@ -143,10 +161,10 @@ public final class BigBroMicrophone: ObservableObject {
             self.configurationObserver = nil
         }
 
-        if engine.isRunning {
-            engine.inputNode.removeTap(onBus: 0)
-            engine.stop()
-        }
+        engine.inputNode.removeTap(onBus: 0)
+        // A borrowed engine may still be playing something. Removing the tap ends capture;
+        // stopping the engine would end the answer mid-sentence as well.
+        if ownsEngine, engine.isRunning { engine.stop() }
         detector.reset()
 
         continuation?.finish()
@@ -235,6 +253,9 @@ public final class BigBroMicrophone: ObservableObject {
     /// and its converter were built for the old format and are now scrap. Without this the
     /// microphone goes quietly dead the moment a headset is paired, which is indistinguishable
     /// from a loop that has simply stopped hearing anything.
+    ///
+    /// Turning voice processing on fires this too, and deliberately: the engine stops itself
+    /// when its configuration changes, and only reattaching here brings it back.
     private func observeConfigurationChanges() {
         guard configurationObserver == nil else { return }
         configurationObserver = NotificationCenter.default.addObserver(
@@ -244,8 +265,10 @@ public final class BigBroMicrophone: ObservableObject {
         ) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self, self.isCapturing else { return }
+                // The engine has already stopped itself. Stopping it again would be pointless
+                // on a private engine and actively wrong on a shared one, where the player
+                // node is about to be restarted through the same object.
                 self.engine.inputNode.removeTap(onBus: 0)
-                if self.engine.isRunning { self.engine.stop() }
                 do {
                     try self.attachTap()
                 } catch {

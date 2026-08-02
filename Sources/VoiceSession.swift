@@ -111,6 +111,8 @@ public final class BigBroVoiceSession: ObservableObject {
     public var followUpWindow: TimeInterval
 
     private let client: BigBroClient
+    /// One engine for both directions. See the note where the two are constructed.
+    private let engine = AVAudioEngine()
     private let microphone: BigBroMicrophone
     private let player: BigBroAudioPlayer
     private let systemPrompt: String?
@@ -148,8 +150,16 @@ public final class BigBroVoiceSession: ObservableObject {
         // Both are told not to touch the audio session: capture needs `.playAndRecord` and
         // playback would set `.playback`, and whichever ran last would win — silencing the
         // microphone or routing the answer to the earpiece. This type owns the session for both.
-        self.microphone = BigBroMicrophone(tuning: tuning, configuresAudioSession: false)
-        self.player = BigBroAudioPlayer(configuresAudioSession: false)
+        //
+        // They also share one engine, which is what makes voice processing work at all. The
+        // processing lives in a single I/O unit and sees only the streams inside its own
+        // engine: with capture in one and playback in another it has no reference signal to
+        // cancel the echo against, and reports of that arrangement are that it silences
+        // playback almost completely.
+        self.microphone = BigBroMicrophone(
+            tuning: tuning, configuresAudioSession: false, engine: engine
+        )
+        self.player = BigBroAudioPlayer(configuresAudioSession: false, engine: engine)
 
         if let systemPrompt, !systemPrompt.isEmpty {
             history = [.system(systemPrompt)]
@@ -186,6 +196,16 @@ public final class BigBroVoiceSession: ObservableObject {
         guard phase == .idle else { return }
         error = nil
         didBargeIn = false
+
+        // Before the audio session is touched. Configuring a `.playAndRecord` session and
+        // enabling voice processing both reach for an input this app may not yet be allowed
+        // to open, and the failure that produces is a silent microphone rather than an error.
+        // Asking here also means a refusal is reported straight away, instead of after the
+        // wait for speech models below.
+        guard await AVAudioApplication.requestRecordPermission() else {
+            self.error = BigBroMicrophone.CaptureError.permissionDenied.localizedDescription
+            return
+        }
 
         do {
             try configureAudioSession()
@@ -501,23 +521,53 @@ public final class BigBroVoiceSession: ObservableObject {
     /// user talking, and the loop interrupts itself in a cycle that never settles.
     private func configureAudioSession() throws {
         let session = AVAudioSession.sharedInstance()
-        // `.videoChat`, not `.voiceChat`. Both give the echo cancellation barge-in needs,
-        // but `.voiceChat` tells iOS this is a phone call: playback is then governed by the
-        // call volume and follows the ring/silent switch, so a muted ringer makes the
-        // assistant almost inaudible.
+        // `.videoChat`, not `.voiceChat`. Both ask for the same voice processing, but
+        // `.voiceChat` tells iOS this is a phone call: playback is then governed by the call
+        // volume and follows the ring/silent switch, so a muted ringer makes the assistant
+        // almost inaudible.
         try session.setCategory(.playAndRecord, mode: .videoChat,
                                 options: [.defaultToSpeaker, .allowBluetooth])
         try session.setActive(true)
+        enableVoiceProcessing()
         BigBroAudioRoute.preferLoudestBuiltIn()
 
         // The route can change under a running session — AirPods connect, a headset is
-        // unplugged — and the choice below has to be made again each time it does.
+        // unplugged — and the choice above has to be made again each time it does.
         NotificationCenter.default.addObserver(
             forName: AVAudioSession.routeChangeNotification,
             object: session,
             queue: .main
         ) { _ in
             MainActor.assumeIsolated { BigBroAudioRoute.preferLoudestBuiltIn() }
+        }
+    }
+
+    /// Turns on the processing a chat mode only *asks* for.
+    ///
+    /// Setting `.videoChat` is half of the bargain, and the half that costs rather than pays.
+    /// Apple's terms are explicit: for apps that use a chat mode but do not use Audio Unit
+    /// Voice I/O or `AVAudioEngine.setVoiceProcessingEnabled(_:)`, the system "doesn't apply
+    /// voice-specific processing, like echo cancellation and automatic gain correction, and
+    /// disables dynamic processing on input and output, which results in a lower playback
+    /// level."
+    ///
+    /// So the mode alone bought none of the echo cancellation this loop is built on, no gain
+    /// correction on a microphone that was reported as barely hearing anything, and a
+    /// deliberately quieter output. All three complaints, one missing call.
+    ///
+    /// Enabling it on the input node enables it on the output node too — they are one I/O
+    /// unit — which is also why the microphone and the player have to share this engine.
+    private func enableVoiceProcessing() {
+        do {
+            // Before anything is connected or started. Reconfiguring the unit makes the
+            // engine stop itself and post a configuration change; doing it here means there
+            // is nothing running to interrupt, and the microphone starts it afterwards. The
+            // observer matters for the changes that come later, mid-session.
+            try engine.inputNode.setVoiceProcessingEnabled(true)
+        } catch {
+            // Not fatal. Without it the loop still runs, quieter and liable to interrupt
+            // itself on its own voice — which is how it behaved before this call existed.
+            print("[BigBroVoiceSession] voice processing unavailable: \(error.localizedDescription)")
         }
     }
 }

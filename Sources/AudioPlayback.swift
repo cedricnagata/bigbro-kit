@@ -27,7 +27,9 @@ public final class BigBroAudioPlayer {
         }
     }
 
-    private let engine = AVAudioEngine()
+    private let engine: AVAudioEngine
+    /// False when the engine was handed in, in which case stopping is somebody else's call.
+    private let ownsEngine: Bool
     private let node = AVAudioPlayerNode()
     private let format: AVAudioFormat
     private let configuresAudioSession: Bool
@@ -46,16 +48,25 @@ public final class BigBroAudioPlayer {
     ///   - configuresAudioSession: Leave `true` for apps with no audio session handling of their
     ///     own. Set `false` when the host app already manages `AVAudioSession` itself — otherwise
     ///     the two fight over the category and playback can be routed to the wrong output.
+    ///   - engine: An engine to play through, instead of a private one.
+    ///
+    ///     Pass the same engine here and to `BigBroMicrophone` when recording at the same time.
+    ///     Voice processing lives in one I/O unit and sees only the streams inside its own
+    ///     engine, so split across two it can neither cancel the echo nor apply the dynamic
+    ///     processing that brings playback up to a normal level.
     public init(
         sampleRate: Double = 24_000,
         channels: AVAudioChannelCount = 1,
-        configuresAudioSession: Bool = true
+        configuresAudioSession: Bool = true,
+        engine: AVAudioEngine? = nil
     ) {
         // Float32 deinterleaved is AVAudioEngine's native currency, so converting on the way in
         // avoids an AVAudioConverter for the interleaved-Int16 wire format.
         self.format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: channels)
             ?? AVAudioFormat(standardFormatWithSampleRate: 24_000, channels: 1)!
         self.configuresAudioSession = configuresAudioSession
+        self.engine = engine ?? AVAudioEngine()
+        self.ownsEngine = engine == nil
     }
 
     // MARK: - Playback
@@ -105,7 +116,9 @@ public final class BigBroAudioPlayer {
     /// Apps that manage their own `AVAudioSession` should call this before deactivating it.
     public func shutdown() {
         stop()
-        if engine.isRunning { engine.stop() }
+        // A borrowed engine may still be capturing. Stopping it would take the microphone
+        // down with the speaker.
+        if ownsEngine, engine.isRunning { engine.stop() }
     }
 
     public var isPlaying: Bool { node.isPlaying }
