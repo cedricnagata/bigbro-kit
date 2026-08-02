@@ -51,6 +51,12 @@ public final class BigBroVoiceSession: ObservableObject {
     @Published public private(set) var error: String?
     /// Smoothed 0...1 input level, mirrored from the microphone for meters.
     @Published public private(set) var level: Float = 0
+    /// The level ``level`` has to clear before the loop treats it as speech, same scale.
+    ///
+    /// Worth drawing on the meter. A microphone that hears nothing and a threshold sitting
+    /// above a microphone that hears plenty produce the same silence, and only this tells
+    /// them apart.
+    @Published public private(set) var threshold: Float = 0
     /// True once the user has interrupted and before the next turn starts.
     @Published public private(set) var didBargeIn = false
 
@@ -154,6 +160,11 @@ public final class BigBroVoiceSession: ObservableObject {
             .sink { [weak self] in self?.level = $0 }
             .store(in: &cancellables)
 
+        microphone.$threshold
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] in self?.threshold = $0 }
+            .store(in: &cancellables)
+
         // Barge-in has to come from the level detector, not from the utterance stream: an
         // utterance is only emitted once the user stops talking, which is far too late to
         // interrupt with. This fires on the leading edge instead.
@@ -221,6 +232,16 @@ public final class BigBroVoiceSession: ObservableObject {
 
     /// Where the loop sits between turns: waiting for its name, or for anything at all.
     private var restingPhase: Phase { wakeWord == nil ? .listening : .armed }
+
+    /// Endpointing thresholds, adjustable while the loop runs.
+    ///
+    /// The defaults suit a phone held at conversational distance. A room, a headset, or a
+    /// quiet talker can all want something else, and having to stop and rebuild the session
+    /// to try a number makes tuning by ear impractical.
+    public var tuning: BigBroMicrophone.Tuning {
+        get { microphone.tuning }
+        set { microphone.tuning = newValue }
+    }
 
     /// Forgets the conversation, keeping the system prompt. The session can keep running.
     public func resetConversation() {
@@ -330,7 +351,12 @@ public final class BigBroVoiceSession: ObservableObject {
         case .summoned:
             // Called by name with nothing after it. Answering the name itself would be a
             // non-sequitur; take the next thing said as the request instead.
-            transcript = heard
+            //
+            // `transcript` deliberately not set. It means "what the user asked", and callers
+            // mirror it into a conversation as the user's turn — publishing the wake phrase
+            // there posts "hey big bro" as a message and leaves an answer bubble waiting for
+            // a reply that was never requested. Waking is reported by the phase, which is
+            // where a caller looks for it.
             openFollowUp()
 
         case .request(let request):
@@ -478,15 +504,20 @@ public final class BigBroVoiceSession: ObservableObject {
         // `.videoChat`, not `.voiceChat`. Both give the echo cancellation barge-in needs,
         // but `.voiceChat` tells iOS this is a phone call: playback is then governed by the
         // call volume and follows the ring/silent switch, so a muted ringer makes the
-        // assistant almost inaudible. `.videoChat` keeps the cancellation and plays through
-        // the main speaker at media levels.
+        // assistant almost inaudible.
         try session.setCategory(.playAndRecord, mode: .videoChat,
                                 options: [.defaultToSpeaker, .allowBluetooth])
         try session.setActive(true)
-        // `.defaultToSpeaker` only sets the *default* route, and it is given up whenever the
-        // route is re-evaluated — which `.playAndRecord` does when the session activates and
-        // whenever a device is plugged in. Forcing the port keeps playback on the main
-        // speaker rather than dropping to the receiver, where it is barely audible.
-        try? session.overrideOutputAudioPort(.speaker)
+        BigBroAudioRoute.preferLoudestBuiltIn()
+
+        // The route can change under a running session — AirPods connect, a headset is
+        // unplugged — and the choice below has to be made again each time it does.
+        NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: session,
+            queue: .main
+        ) { _ in
+            MainActor.assumeIsolated { BigBroAudioRoute.preferLoudestBuiltIn() }
+        }
     }
 }

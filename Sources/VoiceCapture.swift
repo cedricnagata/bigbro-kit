@@ -53,10 +53,28 @@ public final class BigBroMicrophone: ObservableObject {
         public var minUtteranceDuration: TimeInterval = 0.25
         /// How far above the measured room tone speech has to sit. A multiplier rather than a
         /// fixed level so the same numbers work in a quiet room and a noisy one.
-        public var speechThresholdMultiplier: Float = 3.0
+        ///
+        /// Kept low deliberately. The cost of triggering on something that wasn't speech is
+        /// one transcription that comes back empty and is dropped; the cost of missing real
+        /// speech is a loop that appears not to work at all. Those are not comparable, so
+        /// this errs sensitive.
+        public var speechThresholdMultiplier: Float = 2.0
         /// Floor under the adaptive threshold, so near-silence can't drive it to zero and make
         /// every faint rustle read as speech.
-        public var minimumSpeechLevel: Float = 0.012
+        ///
+        /// A chat-mode session runs the microphone through noise suppression and automatic
+        /// gain control before any of this sees it, and what arrives is a good deal quieter
+        /// than the raw capture — which is why this sits well below where untreated speech
+        /// would need it to be.
+        public var minimumSpeechLevel: Float = 0.005
+        /// Ceiling on the adaptive threshold, whatever the room tone measures.
+        ///
+        /// The noise floor tracks upward while nobody is talking, and anything that holds it
+        /// high — a fan, traffic, the assistant's own voice leaking past echo cancellation —
+        /// drags the bar above ordinary speech and locks the user out for the rest of the
+        /// session. Speech near the microphone clears this comfortably, so capping it costs
+        /// nothing in a quiet room and rescues a noisy one.
+        public var maximumSpeechLevel: Float = 0.05
 
         public init() {}
     }
@@ -67,6 +85,12 @@ public final class BigBroMicrophone: ObservableObject {
     @Published public private(set) var isSpeaking = false
     /// Smoothed 0...1 input level, for a meter. Updated at UI rate, not audio rate.
     @Published public private(set) var level: Float = 0
+    /// The level speech currently has to clear, on the same 0...1 scale as ``level``.
+    ///
+    /// Published so a meter can draw the bar next to the signal. "It isn't hearing me" has
+    /// two very different causes — a microphone delivering nothing, or one delivering plenty
+    /// under a threshold that has drifted above it — and they look identical without this.
+    @Published public private(set) var threshold: Float = 0
 
     public var tuning: Tuning {
         get { detector.tuning }
@@ -78,6 +102,7 @@ public final class BigBroMicrophone: ObservableObject {
     private let configuresAudioSession: Bool
     private var continuation: AsyncThrowingStream<Data, Error>.Continuation?
     private var stateTask: Task<Void, Never>?
+    private var configurationObserver: NSObjectProtocol?
 
     /// - Parameter configuresAudioSession: Leave `true` for apps with no audio session of
     ///   their own. `BigBroVoiceSession` sets it `false` and configures the session itself,
@@ -113,6 +138,11 @@ public final class BigBroMicrophone: ObservableObject {
         stateTask?.cancel()
         stateTask = nil
 
+        if let configurationObserver {
+            NotificationCenter.default.removeObserver(configurationObserver)
+            self.configurationObserver = nil
+        }
+
         if engine.isRunning {
             engine.inputNode.removeTap(onBus: 0)
             engine.stop()
@@ -143,14 +173,24 @@ public final class BigBroMicrophone: ObservableObject {
                 try session.setCategory(.playAndRecord, mode: .videoChat,
                                         options: [.defaultToSpeaker, .allowBluetooth])
                 try session.setActive(true)
-                // `.defaultToSpeaker` is only a default and is given up when the route is
-                // re-evaluated; forcing the port keeps playback off the receiver.
-                try? session.overrideOutputAudioPort(.speaker)
+                BigBroAudioRoute.preferLoudestBuiltIn()
             } catch {
                 throw CaptureError.engineFailed(error.localizedDescription)
             }
         }
 
+        observeConfigurationChanges()
+        try attachTap()
+        isCapturing = true
+        startStatePolling()
+    }
+
+    /// Installs the tap and starts the engine, at whatever format the current input is.
+    ///
+    /// Separate from `startEngine` because it has to run again on every route change: the
+    /// converter below is built for one input format, and AirPods connecting swaps a 48 kHz
+    /// built-in microphone for a 16 kHz Bluetooth one.
+    private func attachTap() throws {
         let input = engine.inputNode
         let inputFormat = input.outputFormat(forBus: 0)
         guard inputFormat.sampleRate > 0 else {
@@ -166,6 +206,7 @@ public final class BigBroMicrophone: ObservableObject {
         }
 
         let detector = self.detector
+        // Room tone measured through the old microphone says nothing about the new one.
         detector.reset()
         detector.onUtterance = { [weak self] wav in
             // Hops off the audio thread — the continuation is thread-safe, but anything
@@ -185,9 +226,37 @@ public final class BigBroMicrophone: ObservableObject {
             input.removeTap(onBus: 0)
             throw CaptureError.engineFailed(error.localizedDescription)
         }
+    }
 
-        isCapturing = true
-        startStatePolling()
+    /// Rebuilds the capture path when the hardware under it changes.
+    ///
+    /// AirPods connecting replaces the input device outright — a 48 kHz built-in microphone
+    /// becomes a 16 kHz Bluetooth one — and AVAudioEngine stops rather than adapting. The tap
+    /// and its converter were built for the old format and are now scrap. Without this the
+    /// microphone goes quietly dead the moment a headset is paired, which is indistinguishable
+    /// from a loop that has simply stopped hearing anything.
+    private func observeConfigurationChanges() {
+        guard configurationObserver == nil else { return }
+        configurationObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: engine,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.isCapturing else { return }
+                self.engine.inputNode.removeTap(onBus: 0)
+                if self.engine.isRunning { self.engine.stop() }
+                do {
+                    try self.attachTap()
+                } catch {
+                    // Reported rather than swallowed: capture is over either way, and a
+                    // stream that just stops yielding gives the caller nothing to say.
+                    self.continuation?.finish(throwing: error)
+                    self.continuation = nil
+                    self.isCapturing = false
+                }
+            }
+        }
     }
 
     /// Mirrors the detector's state onto published properties at UI rate.
@@ -203,6 +272,7 @@ public final class BigBroMicrophone: ObservableObject {
                 let snapshot = self.detector.snapshot()
                 if self.isSpeaking != snapshot.isSpeaking { self.isSpeaking = snapshot.isSpeaking }
                 self.level = snapshot.level
+                self.threshold = snapshot.threshold
                 try? await Task.sleep(for: .milliseconds(50))
             }
         }
@@ -278,9 +348,15 @@ private final class UtteranceDetector: @unchecked Sendable {
         }
     }
 
-    func snapshot() -> (isSpeaking: Bool, level: Float) {
-        lock.withLock { (inUtterance, min(smoothedLevel * 8, 1)) }
+    func snapshot() -> (isSpeaking: Bool, level: Float, threshold: Float) {
+        lock.withLock {
+            (inUtterance, Self.scale(smoothedLevel), Self.scale(currentThresholdLocked()))
+        }
     }
+
+    /// Both the meter and the threshold readout use this, so they stay comparable — a bar
+    /// drawn on one scale against a signal on another is worse than showing neither.
+    private static func scale(_ level: Float) -> Float { min(level * 8, 1) }
 
     func consume(_ buffer: AVAudioPCMBuffer) {
         guard let channel = buffer.floatChannelData?[0] else { return }
@@ -294,8 +370,7 @@ private final class UtteranceDetector: @unchecked Sendable {
         let completed: Data? = lock.withLock {
             smoothedLevel += (rms - smoothedLevel) * 0.3
 
-            let threshold = max(noiseFloor * _tuning.speechThresholdMultiplier, _tuning.minimumSpeechLevel)
-            let voiced = rms > threshold
+            let voiced = rms > currentThresholdLocked()
 
             if voiced {
                 voicedRun += duration
@@ -333,6 +408,14 @@ private final class UtteranceDetector: @unchecked Sendable {
         }
 
         if let completed { onUtterance?(completed) }
+    }
+
+    /// The bar speech has to clear right now. Caller must hold the lock.
+    private func currentThresholdLocked() -> Float {
+        min(
+            max(noiseFloor * _tuning.speechThresholdMultiplier, _tuning.minimumSpeechLevel),
+            _tuning.maximumSpeechLevel
+        )
     }
 
     private func appendPrerollLocked(_ samples: [Float]) {
