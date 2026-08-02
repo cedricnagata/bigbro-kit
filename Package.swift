@@ -11,6 +11,11 @@ let package = Package(
         .target(
             name: "BigBroKit",
             path: "Sources"
+        ),
+        .testTarget(
+            name: "BigBroKitTests",
+            dependencies: ["BigBroKit"],
+            path: "Tests"
         )
     ]
 )
