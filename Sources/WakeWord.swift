@@ -14,7 +14,34 @@ import Foundation
 ///
 /// The phrase must open the utterance. Allowing it anywhere would fire on any passing mention
 /// of the name, which in a room where the session is armed is most of them.
-public struct WakeWord: Sendable, Equatable {
+///
+/// ## Choosing your own
+///
+/// The name belongs to the app, not to this package, so a string literal is a `WakeWord`
+/// wherever one is expected:
+///
+/// ```swift
+/// let session = BigBroVoiceSession(client: client, model: model, wakeWord: "hey jarvis")
+/// session.wakeWord = "computer"          // changed mid-session; takes effect next utterance
+/// ```
+///
+/// Anything built from a variable — a phrase typed into a settings field — needs the
+/// initializer, which is also where the tuning lives:
+///
+/// ```swift
+/// session.wakeWord = WakeWord(
+///     userTypedPhrase,
+///     aliases: ["hey jarvous"],   // how a transcriber mangles it in practice
+///     tolerance: 0.3              // how much mangling still counts
+/// )
+/// ```
+///
+/// Two things are worth knowing before picking a phrase. Something two or three syllables long
+/// with uncommon sounds matches far more reliably than a short common word, because everything
+/// here rests on a transcriber that has never seen the name. And a phrase that normalizes to
+/// fewer than ``minimumLength`` characters is rejected outright rather than left silently
+/// matching nothing — check ``isEmpty`` when the phrase came from a user.
+public struct WakeWord: Sendable, Equatable, ExpressibleByStringLiteral {
 
     /// What the assistant answers to. The first is the canonical spelling; the rest are
     /// alternates for a name that might be transcribed as a genuinely different word.
@@ -34,20 +61,45 @@ public struct WakeWord: Sendable, Equatable {
     /// phrase is reckless on a short one — one edit on "bro" matches most three-letter words.
     public var tolerance: Double
 
-    /// A phrase shorter than this is rejected at init. Below roughly this length the tolerance
-    /// window overlaps too much ordinary speech to be usable as a gate.
-    public static let minimumPhraseLength = 4
+    /// Shortest phrase accepted, counted after normalization. Anything shorter is dropped.
+    ///
+    /// A gate is only worth having if it stays shut, and below roughly this length the
+    /// tolerance window overlaps too much ordinary speech for it to. Raise it for a phrase
+    /// that has to survive a noisy room; lower it if your app's name really is that short and
+    /// you would rather have the false wakes than the wrong name.
+    public var minimumLength: Int
 
-    public static let `default` = WakeWord("hey big bro")
+    /// The canonical phrase, for showing the user what the assistant answers to.
+    ///
+    /// Empty when no phrase survived — see ``isEmpty``.
+    public var phrase: String { phrases.first ?? "" }
+
+    /// The default sample length, used when a caller does not choose one.
+    public static let defaultMinimumLength = 4
+
+    /// BigBro's own name. Replace it with your app's — nothing here depends on this value.
+    public static let `default`: WakeWord = "hey big bro"
 
     /// - Parameters:
     ///   - phrase: What to listen for. Case, spacing and punctuation are all ignored.
     ///   - aliases: Alternate spellings, tried in order after `phrase`.
     ///   - tolerance: Fraction of the phrase that may be misheard. See ``tolerance``.
-    public init(_ phrase: String, aliases: [String] = [], tolerance: Double = 0.25) {
-        self.phrases = ([phrase] + aliases)
-            .filter { Self.normalize($0).count >= Self.minimumPhraseLength }
+    ///   - minimumLength: Shortest phrase accepted. See ``minimumLength``.
+    public init(
+        _ phrase: String,
+        aliases: [String] = [],
+        tolerance: Double = 0.25,
+        minimumLength: Int = WakeWord.defaultMinimumLength
+    ) {
+        self.minimumLength = minimumLength
         self.tolerance = max(0, tolerance)
+        self.phrases = ([phrase] + aliases)
+            .filter { Self.normalize($0).count >= minimumLength }
+    }
+
+    /// So the phrase can be written where one is expected: `session.wakeWord = "hey jarvis"`.
+    public init(stringLiteral value: String) {
+        self.init(value)
     }
 
     /// True when no usable phrase survived initialization, in which case ``match(_:)`` never

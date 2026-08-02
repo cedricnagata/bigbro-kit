@@ -417,7 +417,7 @@ that cancellation propagates, so the Mac stops generating rather than finishing 
 nobody will hear. The interrupted turn is still committed to history, partial answer included,
 so a follow-up like "sorry, go on" has something to refer to.
 
-The session sets `.playAndRecord` with mode `.voiceChat`, which is what enables the system
+The session sets `.playAndRecord` with mode `.videoChat`, which is what enables the system
 echo canceller. Without it the microphone hears the assistant's own voice, the endpointer
 reads that as the user talking, and the loop interrupts itself in a cycle that never settles.
 If echo cancellation is failing on some device, `allowsBargeIn = false` makes the loop
@@ -425,6 +425,55 @@ half-duplex instead of letting it argue with itself.
 
 `setHistory(_:)` adopts an existing conversation, so switching from typing to voice continues
 it rather than starting over.
+
+---
+
+### `WakeWord` — answering only when spoken to
+
+By default the loop answers everything it hears, which is right for a phone held to your face
+and wrong for anything left running in an occupied room. Give it a name and it answers only
+what is addressed to it.
+
+The name is your app's, not this package's — a string literal is enough:
+
+```swift
+let session = BigBroVoiceSession(client: client, model: model, wakeWord: "hey jarvis")
+
+session.wakeWord = "computer"               // changed mid-session; applies next utterance
+session.wakeWord = WakeWord(fromSettings)   // anything that isn't a literal
+session.wakeWord = nil                      // back to answering everything
+```
+
+Both shapes of address work. `"Hey Jarvis, what's the weather?"` is answered straight away;
+`"Hey Jarvis"` on its own opens the microphone and takes the next thing said as the request.
+
+After answering, the session keeps taking questions for `followUpWindow` seconds (8 by
+default, 0 to disable) without the phrase — needing to say the name before every follow-up is
+most of what makes these assistants tiring to talk to. `Phase.armed` is waiting for the name;
+`Phase.listening` is inside that window. **Show them differently.** They are the difference
+between the user's turn and not, and a UI that conflates them is unusable.
+
+**Matching runs on the transcript, not the audio.** The microphone already endpoints utterances
+and the Mac already transcribes them, so this costs no new model, no new dependency and no API
+key — what it adds is the decision about which transcripts were meant for you. The cost is that
+speech in the room is transcribed on your Mac even when it wasn't addressed to the assistant.
+
+Matching is deliberately loose, because the transcriber has never seen your name and returns
+things like "hey big brow" or "hey pig bro" for it. `tolerance` is the fraction of the phrase
+that may be misheard (0.25 by default; 0 demands it verbatim), scaled to length rather than
+fixed — the slack that is generous on a long phrase matches half the language on a short one.
+Case, punctuation and spacing are all ignored, so `"bigbro"` and `"big bro"` are one phrase.
+Use `aliases` only for spellings that are genuinely different words.
+
+Two rules for picking one. Two or three syllables with uncommon sounds beats a short common
+word by a wide margin. And a phrase shorter than `minimumLength` (4 characters normalized) is
+rejected rather than left silently matching nothing — check `isEmpty` before starting a session
+on a phrase a user typed:
+
+```swift
+let wake = WakeWord(userTypedPhrase)
+guard !wake.isEmpty else { /* too short to gate on; tell them */ return }
+```
 
 ---
 

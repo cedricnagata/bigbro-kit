@@ -82,6 +82,16 @@ public final class BigBroVoiceSession: ObservableObject {
     /// happening — the microphone stays open either way, but what counts as being spoken to
     /// narrows to what was addressed by name.
     ///
+    /// The phrase is your app's to choose, and a string literal is enough for a fixed one:
+    ///
+    /// ```swift
+    /// session.wakeWord = "hey jarvis"
+    /// session.wakeWord = WakeWord(fromSettings)   // anything not a literal
+    /// session.wakeWord = nil                      // back to answering everything
+    /// ```
+    ///
+    /// See ``WakeWord`` for aliases, tolerance, and what makes a phrase match reliably.
+    ///
     /// Changing this mid-session takes effect on the next utterance, and moves the resting
     /// phase between ``Phase/armed`` and ``Phase/listening`` at the end of the current turn.
     public var wakeWord: WakeWord?

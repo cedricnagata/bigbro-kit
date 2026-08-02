@@ -86,6 +86,37 @@ final class WakeWordTests: XCTestCase {
         XCTAssertEqual(wake.match("computer lights on")?.request, "lights on")
     }
 
+    /// The name belongs to the app using the kit, so writing one has to be as cheap as
+    /// writing a string.
+    func testAStringLiteralIsAWakeWord() {
+        let wake: WakeWord = "hey jarvis"
+        XCTAssertEqual(wake.match("hey jarvis lights on")?.request, "lights on")
+        XCTAssertNil(wake.match("hey big bro lights on"))
+    }
+
+    func testOptionalTakesAStringLiteralToo() {
+        let wake: WakeWord? = "computer"
+        XCTAssertEqual(wake?.match("computer lights on")?.request, "lights on")
+    }
+
+    func testPhraseReportsTheCanonicalSpelling() {
+        XCTAssertEqual(WakeWord("hey jarvis", aliases: ["jarvis"]).phrase, "hey jarvis")
+        XCTAssertEqual(WakeWord("yo").phrase, "")
+    }
+
+    /// The floor is a default, not a rule: an app whose name really is that short should be
+    /// able to take the false wakes rather than the wrong name.
+    func testMinimumLengthIsTunable() {
+        XCTAssertTrue(WakeWord("ava").isEmpty)
+        let short = WakeWord("ava", minimumLength: 3)
+        XCTAssertFalse(short.isEmpty)
+        XCTAssertEqual(short.match("ava lights on")?.request, "lights on")
+    }
+
+    func testDefaultIsBigBrosOwnName() {
+        XCTAssertEqual(WakeWord.default.phrase, "hey big bro")
+    }
+
     /// Below a few characters the tolerance window overlaps too much ordinary speech for the
     /// gate to mean anything, so such a phrase is refused rather than silently useless.
     func testRejectsAPhraseTooShortToGateOn() {
