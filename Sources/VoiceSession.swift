@@ -120,6 +120,7 @@ public final class BigBroVoiceSession: ObservableObject {
     private var loopTask: Task<Void, Never>?
     private var turnTask: Task<Void, Never>?
     private var rearmTask: Task<Void, Never>?
+    private var routeObserver: NSObjectProtocol?
     /// True while a follow-up may be spoken without the wake phrase.
     private var followUpOpen = false
     private var cancellables: Set<AnyCancellable> = []
@@ -236,8 +237,10 @@ public final class BigBroVoiceSession: ObservableObject {
         closeFollowUp()
         microphone.stop()
         player.stop()
+        releaseAudio()
         phase = .idle
         level = 0
+        threshold = 0
         didBargeIn = false
     }
 
@@ -533,13 +536,34 @@ public final class BigBroVoiceSession: ObservableObject {
 
         // The route can change under a running session — AirPods connect, a headset is
         // unplugged — and the choice above has to be made again each time it does.
-        NotificationCenter.default.addObserver(
+        guard routeObserver == nil else { return }
+        routeObserver = NotificationCenter.default.addObserver(
             forName: AVAudioSession.routeChangeNotification,
             object: session,
             queue: .main
         ) { _ in
             MainActor.assumeIsolated { BigBroAudioRoute.preferLoudestBuiltIn() }
         }
+    }
+
+    /// Gives back the engine and the audio session.
+    ///
+    /// The microphone and the player were both handed this engine rather than making their
+    /// own, and neither will stop something it does not own — so stopping it falls here.
+    /// Left running it holds a `.playAndRecord` route and an open microphone for the rest of
+    /// the app's life, and the next thing that wants the speaker gets an engine that starts
+    /// but never renders: buffers scheduled, no I/O cycles, and a caller waiting forever on
+    /// audio that cannot play.
+    private func releaseAudio() {
+        if let routeObserver {
+            NotificationCenter.default.removeObserver(routeObserver)
+            self.routeObserver = nil
+        }
+        if engine.isRunning { engine.stop() }
+        // Deactivated so whatever plays next picks its own category, rather than inheriting
+        // a chat session tuned for a conversation that has ended.
+        try? AVAudioSession.sharedInstance()
+            .setActive(false, options: .notifyOthersOnDeactivation)
     }
 
     /// Turns on the processing a chat mode only *asks* for.

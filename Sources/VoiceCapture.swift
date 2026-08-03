@@ -54,20 +54,24 @@ public final class BigBroMicrophone: ObservableObject {
         /// How far above the measured room tone speech has to sit. A multiplier rather than a
         /// fixed level so the same numbers work in a quiet room and a noisy one.
         ///
-        /// Kept low deliberately. The cost of triggering on something that wasn't speech is
-        /// one transcription that comes back empty and is dropped; the cost of missing real
-        /// speech is a loop that appears not to work at all. Those are not comparable, so
-        /// this errs sensitive.
-        public var speechThresholdMultiplier: Float = 2.0
+        /// Still erring sensitive — a false trigger costs one transcription that comes back
+        /// empty and is dropped, while missing real speech looks like a loop that does not
+        /// work — but less so than before automatic gain correction was actually switched on.
+        /// Both this and ``minimumSpeechLevel`` were set against a signal the system was
+        /// quietly declining to process, and were too low once it started.
+        public var speechThresholdMultiplier: Float = 2.5
         /// Floor under the adaptive threshold, so near-silence can't drive it to zero and make
         /// every faint rustle read as speech.
         ///
-        /// Deliberately low. How loud speech arrives here depends on whether voice processing
-        /// is running: with it, automatic gain correction normalizes the input upward, and
-        /// without it the system actively reduces the processing applied to a chat-mode
-        /// session and delivers something much quieter. This has to clear the quiet case,
-        /// and the cost of it being low in the loud one is a false trigger.
-        public var minimumSpeechLevel: Float = 0.005
+        /// Set for the loud case, which is now the only one. Voice processing runs the
+        /// microphone through gain correction before any of this sees it, so speech arrives
+        /// normalized upward and the bar can sit where speech actually is. It was lower while
+        /// that processing was being asked for but not switched on, and the input was
+        /// correspondingly quieter.
+        ///
+        /// The first knob to reach for: raise it if the loop triggers on room noise, lower it
+        /// if it misses quiet talking.
+        public var minimumSpeechLevel: Float = 0.010
         /// Ceiling on the adaptive threshold, whatever the room tone measures.
         ///
         /// The noise floor tracks upward while nobody is talking, and anything that holds it
