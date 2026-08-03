@@ -274,7 +274,9 @@ cache warm-up; a model that has been run stays running until stopped.
 
 #### Speech — `speak()`, `transcribe()`, `converse()`
 
-Requires a speech backend enabled on the Mac (LocalAI by default; Speaches works too).
+Kokoro synthesizes and Parakeet transcribes, both in-process on the Mac via mlx-audio. Neither
+needs enabling: they start on first use like any other model, so the only cost of not calling
+`runSpeech()` first is a slower first turn.
 
 ```swift
 func speak(
