@@ -333,7 +333,10 @@ the last buffer has finished; `stop()` ends playback immediately for barge-in an
 engine running so the next utterance starts without restart latency.
 
 Pass `configuresAudioSession: false` if your app already manages `AVAudioSession` itself —
-otherwise the two fight over the category — and call `shutdown()` before deactivating the session.
+otherwise the two fight over the category — and call `shutdown()` before deactivating the
+session, or before anything else takes the route over. See
+[one owner of the route at a time](#one-owner-of-the-route-at-a-time): leaving this engine
+running while another starts is the one mistake this API punishes hardest.
 
 `transcribe()` is batch, not streaming: record a complete turn, then send it. Uploads are
 capped at 10 MB. Your app needs `NSMicrophoneUsageDescription` to record.
@@ -388,8 +391,11 @@ for try await utterance in mic.utterances() {
 }
 ```
 
-Published state — `isCapturing`, `isSpeaking`, `level` — drives listening indicators and
-meters. `Tuning` exposes the endpointing thresholds; `hangoverDuration` (default 0.7 s) is the
+Published state — `isCapturing`, `isSpeaking`, `level`, `threshold` — drives listening
+indicators and meters; `threshold` is the bar `level` has to clear, on the same scale, and is
+worth drawing on the meter so a microphone that hears nothing is distinguishable from a
+threshold that has drifted above one that hears plenty. `Tuning` exposes the endpointing
+thresholds and is settable while capture runs. `hangoverDuration` (default 0.7 s) is the
 one that decides how responsive the loop feels against how badly it clips people who pause
 mid-sentence. A 0.3 s preroll is kept so the opening consonant isn't lost, since by the time
 energy crosses the threshold the word has already started.
@@ -436,6 +442,45 @@ makes the loop half-duplex instead of letting it argue with itself.
 
 `setHistory(_:)` adopts an existing conversation, so switching from typing to voice continues
 it rather than starting over.
+
+#### One owner of the route at a time
+
+The corollary of the shared engine, and the sharpest edge in this whole API. **Two audio
+engines must never be running at once**, because that is precisely the arrangement voice
+processing cannot work in.
+
+`stop()` on a `BigBroAudioPlayer` ends the utterance but deliberately leaves its engine
+running, so the next one starts without restart latency. That is right for barge-in and wrong
+for handing the route to somebody else. Any app that mixes a standalone player with a
+`BigBroVoiceSession` — speaking typed replies *and* offering hands-free — has to call
+`shutdown()`, not `stop()`, before starting the session, starting a recording, or otherwise
+giving the route away:
+
+```swift
+player.stop()        // barge-in: same player speaks again in a moment
+player.shutdown()    // handing over: something else is about to own the route
+```
+
+`BigBroVoiceSession.stop()` holds up the same end of the bargain. It stops the engine it owns
+and deactivates the audio session, so the next thing to play picks its own category instead of
+inheriting a chat session. Nothing outside the session can do this — the microphone and the
+player were both handed that engine and neither will stop what it does not own.
+
+The failure this prevents is not obvious from the symptom: an engine that starts but never
+renders, so buffers are scheduled, no completion handler ever fires, and `play()` waits
+forever on a drain that cannot finish.
+
+#### Tuning it by ear
+
+`tuning` is settable while the loop runs, so thresholds can be tried without rebuilding a
+session. `threshold` is published next to `level` and on the same scale — draw it on the meter.
+"It isn't hearing me" has two causes that look identical, a microphone delivering nothing and a
+threshold sitting above one delivering plenty, and they want opposite fixes:
+
+```swift
+session.tuning.minimumSpeechLevel = 0.015   // triggering on room noise
+session.tuning.onsetDuration = 0.2          // triggering on doors and keyboards
+```
 
 ---
 
