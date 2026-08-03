@@ -2,7 +2,7 @@
 
 An iOS Swift Package for connecting to a [BigBro](https://github.com/nagata-inc/bigbro) Mac and running inference over the local network. BigBroKit discovers the Mac via Bonjour, establishes a persistent TCP connection, and proxies requests to the Mac's local backend.
 
-The Mac talks to an OpenAI-compatible server — [Ollama](https://ollama.ai) by default for chat, [LocalAI](https://localai.io) for speech — so this package covers chat with full tool calling, single-turn generation, text-to-speech and transcription.
+The Mac runs models in-process on Apple silicon through MLX — language and vision models via mlx-lm and mlx-vlm, Kokoro and Parakeet via mlx-audio — so this package covers chat with full tool calling, single-turn generation, text-to-speech and transcription. There is no Ollama and no separate inference server.
 
 ## Requirements
 
@@ -95,21 +95,23 @@ struct ContentView: View {
 
 ## Required models
 
-Declare the Ollama models your app needs when creating the client. BigBro checks whether they are installed when the device connects and reports any that are missing:
+Declare the models your app needs when creating the client, by their id in the Mac's catalog. BigBro checks whether they are downloaded when the device connects and reports any that are not:
 
 ```swift
 let client = BigBroClient(
     appName: "My App",
-    requiredModels: ["llama3.2", "llava:13b"]
+    requiredModels: ["gpt-oss-20b", "qwen2.5-vl-3b"]
 )
 
 // After pair():
 if !client.missingModels.isEmpty {
-    // Show a warning — these models need to be downloaded in Ollama on the Mac
+    // Show a warning — these need `bigbro models download <id>` on the Mac
 }
 ```
 
-`missingModels` is a `@Published` property. If Ollama's model list changes while the device is connected (e.g. a model is downloaded), the Mac automatically pushes an update and `missingModels` updates in real time — no reconnect needed.
+`missingModels` is a `@Published` property. If the Mac's set of downloaded models changes while the device is connected, it pushes an update and `missingModels` follows in real time — no reconnect needed.
+
+Speech models are not named here. They are not selectable by id; the Mac manages Kokoro and Parakeet itself and starts them on first use.
 
 ## API reference
 
@@ -122,7 +124,7 @@ if !client.missingModels.isEmpty {
 ```swift
 @Published var connectedDevice: BigBroDevice?
 @Published var connectionState: ConnectionState   // .disconnected | .reconnecting | .connected
-@Published var missingModels: [String]            // models not yet installed in Ollama on the Mac
+@Published var missingModels: [String]            // required models not yet downloaded on the Mac
 var isConnected: Bool                             // true only when fully .connected
 ```
 
@@ -162,7 +164,7 @@ func chat(
     options: GenerationOptions? = nil,
     think: Bool? = nil,                        // forward the reasoning trace to this device
     reasoningEffort: ReasoningEffort? = nil,   // how hard the model actually thinks
-    keepAlive: String? = nil      // how long Ollama keeps the model loaded
+    keepAlive: String? = nil      // accepted for compatibility; the Mac ignores it
 ) -> AsyncThrowingStream<String, Error>
 ```
 
@@ -599,11 +601,11 @@ for try await delta in client.chat(history, tools: [dateTool, weatherTool]) {
 }
 ```
 
-**Agentic loop:** When Ollama returns tool calls, the SDK automatically:
+**Agentic loop:** When the model returns tool calls, the SDK automatically:
 1. Executes each tool handler locally on the device
 2. Appends the results to the message history
 3. Re-sends the updated history
-4. Repeats until Ollama returns a final text response
+4. Repeats until the model returns a final text response
 
 The caller never sees intermediate tool calls — only the final streamed text.
 
@@ -611,14 +613,14 @@ The caller never sees intermediate tool calls — only the final streamed text.
 
 ### `GenerationOptions`
 
-Maps directly to Ollama's `options` request field. All fields are optional.
+All fields are optional. The key names are inherited from BigBro's Ollama-proxy days and kept for wire compatibility; the Mac maps a subset — `temperature`, `top_k`, `top_p`, `num_predict`, `repeat_penalty`, `seed` — onto MLX samplers and ignores the rest.
 
 ```swift
 let opts = GenerationOptions(temperature: 0.7, topK: 40, seed: 42)
 for try await delta in client.chat(messages, options: opts) { ... }
 ```
 
-| Swift property | Ollama key | Type |
+| Swift property | Wire key | Type |
 |---|---|---|
 | `temperature` | `temperature` | `Double` |
 | `topK` | `top_k` | `Int` |
@@ -758,5 +760,5 @@ BigBroKit communicates with the Mac over TCP on port 8765. Each message is a 4-b
 
 Every response carries a `requestId` and the client routes on it, so chat, speech and
 transcription can be in flight simultaneously — which `converse()` relies on.
-| `modelsUpdate` | `missingModels` | Live push when Ollama model list changes |
+| `modelsUpdate` | `missingModels` | Live push when the Mac's downloaded models change |
 | `bye` | — | Clean disconnect |

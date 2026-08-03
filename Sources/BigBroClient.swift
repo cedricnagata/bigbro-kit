@@ -226,7 +226,8 @@ public final class BigBroClient: ObservableObject {
     ///   - streaming: When `true` (default), yields text deltas as they arrive.
     ///   - tools: Tools the model may call; the agentic loop runs transparently.
     ///   - format: Constrain the response to JSON or a specific JSON schema.
-    ///   - options: Low-level Ollama model parameters (temperature, top_k, etc.).
+    ///   - options: Low-level sampler parameters (temperature, top_k, etc.). The key names
+    ///     are inherited from BigBro's Ollama-proxy days; the Mac maps a subset onto MLX.
     ///   - think: Whether the Mac should forward the model's reasoning/analysis tokens. The
     ///     model generates them either way; this only controls whether they're sent to you
     ///     (via `onThinking`) or discarded on the Mac. Defaults to on for backward compatibility.
@@ -234,7 +235,8 @@ public final class BigBroClient: ObservableObject {
     ///     Unlike `think`, this changes what the model actually does — `.low` produces a much
     ///     shorter analysis pass and a faster first answer. Defaults to the model's own
     ///     default (`.medium` for gpt-oss). See `ReasoningEffort`.
-    ///   - keepAlive: How long Ollama should keep the model loaded after the request.
+    ///   - keepAlive: Accepted for wire compatibility and ignored by the Mac, which keeps a
+    ///     model loaded until it is explicitly stopped.
     ///   - onThinking: Called with each reasoning token as it streams in, ahead of the final
     ///     answer. Ignored unless `think` is `true`.
     public func chat(
