@@ -425,7 +425,8 @@ across turns, one `AVAudioSession` that capture and playback can share, and barg
 **Barge-in** is on by default. Talking over an answer cuts it off and starts a new turn — and
 that cancellation propagates, so the Mac stops generating rather than finishing an answer
 nobody will hear. The interrupted turn is still committed to history, partial answer included,
-so a follow-up like "sorry, go on" has something to refer to.
+so a follow-up like "sorry, go on" has something to refer to. With a wake word set, what counts
+as talking over it narrows to the phrase; see [`WakeWord`](#wakeword--answering-only-when-spoken-to).
 
 The session sets `.playAndRecord` with mode `.videoChat` **and** calls
 `setVoiceProcessingEnabled(true)` on one engine shared by capture and playback. Both halves
@@ -482,9 +483,14 @@ session. `threshold` is published next to `level` and on the same scale — draw
 threshold sitting above one delivering plenty, and they want opposite fixes:
 
 ```swift
-session.tuning.minimumSpeechLevel = 0.015   // triggering on room noise
-session.tuning.onsetDuration = 0.2          // triggering on doors and keyboards
+session.tuning.minimumSpeechLevel = 0.015   // lower: missing quiet talking
+session.tuning.onsetDuration = 0.25         // raise: triggering on doors and keyboards
 ```
+
+The defaults are set for someone talking *to* the phone rather than near it, which matters
+most in wake-word mode: every utterance that clears the bar during an answer costs a
+transcription round trip to establish it was not the phrase, so a threshold low enough to
+catch the room is a threshold that spends requests on it.
 
 ---
 
@@ -507,11 +513,19 @@ session.wakeWord = nil                      // back to answering everything
 Both shapes of address work. `"Hey Jarvis, what's the weather?"` is answered straight away;
 `"Hey Jarvis"` on its own opens the microphone and takes the next thing said as the request.
 
-After answering, the session keeps taking questions for `followUpWindow` seconds (8 by
-default, 0 to disable) without the phrase — needing to say the name before every follow-up is
-most of what makes these assistants tiring to talk to. `Phase.armed` is waiting for the name;
-`Phase.listening` is inside that window. **Show them differently.** They are the difference
-between the user's turn and not, and a UI that conflates them is unusable.
+**The phrase is the only way in.** Every request needs it, including the one after an answer:
+the session re-arms as soon as it stops speaking rather than staying open, so a room can go on
+talking around it without being answered. `Phase.armed` is waiting for the name;
+`Phase.listening` is the brief window after being named and asked nothing. **Show them
+differently.** They are the difference between the user's turn and not, and a UI that
+conflates them is unusable.
+
+Interruption follows the same rule. Without a wake word, any speech cuts an answer off on the
+leading edge — the moment the microphone hears a voice. With one, only the phrase does: the
+answer keeps playing while what was heard is transcribed, and is left alone unless the session
+was named. Anything else would hand every voice in the room a way to interrupt, which is what
+the wake word was set to prevent. The price is latency, since an interruption cannot land
+until the speaker stops and the utterance transcribes. `allowsBargeIn = false` turns off both.
 
 **Matching runs on the transcript, not the audio.** The microphone already endpoints utterances
 and the Mac already transcribes them, so this costs no new model, no new dependency and no API

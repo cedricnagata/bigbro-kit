@@ -39,7 +39,7 @@ public final class BigBroMicrophone: ObservableObject {
     public struct Tuning: Sendable {
         /// Speech must stay above the threshold this long before an utterance opens. Rejects
         /// coughs, door slams and the leading edge of the device's own speaker.
-        public var onsetDuration: TimeInterval = 0.12
+        public var onsetDuration: TimeInterval = 0.18
         /// Silence this long closes the utterance. The dominant control on how responsive the
         /// loop feels: too short clips people who pause mid-sentence, too long feels sluggish.
         public var hangoverDuration: TimeInterval = 0.7
@@ -50,28 +50,28 @@ public final class BigBroMicrophone: ObservableObject {
         public var maxUtteranceDuration: TimeInterval = 30
         /// Utterances shorter than this are dropped unsent — too brief to be words, and
         /// transcribing them wastes a round trip to produce an empty string.
-        public var minUtteranceDuration: TimeInterval = 0.25
+        public var minUtteranceDuration: TimeInterval = 0.35
         /// How far above the measured room tone speech has to sit. A multiplier rather than a
         /// fixed level so the same numbers work in a quiet room and a noisy one.
         ///
-        /// Still erring sensitive — a false trigger costs one transcription that comes back
-        /// empty and is dropped, while missing real speech looks like a loop that does not
-        /// work — but less so than before automatic gain correction was actually switched on.
-        /// Both this and ``minimumSpeechLevel`` were set against a signal the system was
-        /// quietly declining to process, and were too low once it started.
-        public var speechThresholdMultiplier: Float = 2.5
+        /// No longer erring sensitive. A false trigger was costed as one wasted transcription,
+        /// which was true of the always-on loop and stopped being true with a wake word: the
+        /// session now transcribes to decide whether it is being interrupted, so noise that
+        /// clears this bar interrupts nothing but does spend a round trip, repeatedly, in
+        /// exactly the crowded room the wake word exists for.
+        public var speechThresholdMultiplier: Float = 3.5
         /// Floor under the adaptive threshold, so near-silence can't drive it to zero and make
         /// every faint rustle read as speech.
         ///
         /// Set for the loud case, which is now the only one. Voice processing runs the
         /// microphone through gain correction before any of this sees it, so speech arrives
-        /// normalized upward and the bar can sit where speech actually is. It was lower while
-        /// that processing was being asked for but not switched on, and the input was
-        /// correspondingly quieter.
+        /// normalized upward and the bar can sit where speech actually is.
         ///
         /// The first knob to reach for: raise it if the loop triggers on room noise, lower it
-        /// if it misses quiet talking.
-        public var minimumSpeechLevel: Float = 0.010
+        /// if it misses quiet talking. Deliberately above the level a nearby conversation
+        /// carries at, which means talking to the phone means talking *to* it — a whisper
+        /// from across the room is meant to fall under this.
+        public var minimumSpeechLevel: Float = 0.022
         /// Ceiling on the adaptive threshold, whatever the room tone measures.
         ///
         /// The noise floor tracks upward while nobody is talking, and anything that holds it
@@ -79,7 +79,11 @@ public final class BigBroMicrophone: ObservableObject {
         /// drags the bar above ordinary speech and locks the user out for the rest of the
         /// session. Speech near the microphone clears this comfortably, so capping it costs
         /// nothing in a quiet room and rescues a noisy one.
-        public var maximumSpeechLevel: Float = 0.05
+        ///
+        /// Has to stay clear of ``minimumSpeechLevel``, which it would otherwise silently
+        /// override — the two are a floor and a ceiling on the same number, and a ceiling
+        /// below the floor pins the threshold there and makes the multiplier inert.
+        public var maximumSpeechLevel: Float = 0.09
 
         public init() {}
     }

@@ -29,7 +29,11 @@ public final class BigBroVoiceSession: ObservableObject {
         /// Distinct from ``listening`` because to the user they are different states — one is
         /// its turn to talk, the other is not — even though the microphone is open in both.
         case armed
-        /// Microphone open, waiting for the user to say something.
+        /// Microphone open and whatever is said next taken as a request.
+        ///
+        /// The resting state without a wake word. With one it is reached only by being called
+        /// by name and asked nothing — the session has been summoned and is waiting on the
+        /// request that was promised — and it lapses back to ``armed`` shortly after.
         case listening
         /// An utterance has been captured and is being transcribed on the Mac.
         case transcribing
@@ -69,9 +73,19 @@ public final class BigBroVoiceSession: ObservableObject {
     /// tools still answers; the Mac drops them and says so.
     public var model: String
     public var reasoningEffort: ReasoningEffort?
-    /// When false, anything the user says while the answer plays is discarded instead of
-    /// cutting it off. Worth turning off only if echo cancellation is failing and the loop is
-    /// interrupting itself.
+    /// Whether the user can cut an answer short by talking over it.
+    ///
+    /// What counts as "talking over it" depends on ``wakeWord``. Without one, any speech
+    /// interrupts, on the leading edge — the answer stops the moment the microphone hears a
+    /// voice. With one, only the phrase does: the answer keeps playing while whatever was
+    /// heard is transcribed, and is left alone unless the session was named. The wake word
+    /// would be pointless otherwise, since the whole reason to set one is that the room
+    /// contains speech not addressed here.
+    ///
+    /// The cost of that in wake-word mode is latency — an interruption cannot land until the
+    /// speaker stops and the utterance transcribes, where the always-on case cuts off
+    /// instantly. Worth turning off entirely only if echo cancellation is failing and the
+    /// loop is interrupting itself.
     public var allowsBargeIn: Bool
 
     /// Whether replies are spoken aloud.
@@ -98,17 +112,23 @@ public final class BigBroVoiceSession: ObservableObject {
     ///
     /// See ``WakeWord`` for aliases, tolerance, and what makes a phrase match reliably.
     ///
+    /// Setting one makes the phrase the *only* way in. Every request has to open with it,
+    /// including the one after an answer — the session re-arms as soon as it stops speaking
+    /// rather than staying open for a follow-up, and it interrupts itself for nothing else.
+    /// The single exception is being called by name with no request attached, which opens the
+    /// microphone briefly for the request that was promised; see ``Phase/listening``.
+    ///
     /// Changing this mid-session takes effect on the next utterance, and moves the resting
     /// phase between ``Phase/armed`` and ``Phase/listening`` at the end of the current turn.
     public var wakeWord: WakeWord?
 
-    /// How long after answering the session keeps taking requests without the wake phrase.
+    /// How long a session called by name with nothing after it waits for the request.
     ///
-    /// A follow-up is the common case — "and what about tomorrow?" — and needing to say the
-    /// name again every time is most of what makes a wake-word assistant tiring to talk to.
-    /// 0 re-arms the moment an answer finishes. Ignored when ``wakeWord`` is nil, where the
-    /// session is always taking requests.
-    public var followUpWindow: TimeInterval
+    /// Deliberately not configurable, and short. This is the only state in wake-word mode
+    /// where speech is taken without the phrase, so how long it lasts is exactly how long
+    /// the wake word is not doing its job; a false wake nobody follows up costs this much
+    /// open microphone and no more.
+    private static let summonWindow: TimeInterval = 8
 
     private let client: BigBroClient
     /// One engine for both directions. See the note where the two are constructed.
@@ -118,11 +138,15 @@ public final class BigBroVoiceSession: ObservableObject {
     private let systemPrompt: String?
 
     private var loopTask: Task<Void, Never>?
-    private var turnTask: Task<Void, Never>?
+    /// The answer in flight, if any.
+    ///
+    /// Deliberately not awaited by the loop: an answer plays for seconds, and the utterance
+    /// that interrupts it has to be heard and transcribed while it does.
+    private var answerTask: Task<Void, Never>?
     private var rearmTask: Task<Void, Never>?
     private var routeObserver: NSObjectProtocol?
-    /// True while a follow-up may be spoken without the wake phrase.
-    private var followUpOpen = false
+    /// True between being called by name and the request that follows.
+    private var summoned = false
     private var cancellables: Set<AnyCancellable> = []
 
     public init(
@@ -135,7 +159,6 @@ public final class BigBroVoiceSession: ObservableObject {
         allowsBargeIn: Bool = true,
         speaksReplies: Bool = true,
         wakeWord: WakeWord? = nil,
-        followUpWindow: TimeInterval = 8,
         tuning: BigBroMicrophone.Tuning = BigBroMicrophone.Tuning()
     ) {
         self.client = client
@@ -147,7 +170,6 @@ public final class BigBroVoiceSession: ObservableObject {
         self.allowsBargeIn = allowsBargeIn
         self.speaksReplies = speaksReplies
         self.wakeWord = wakeWord
-        self.followUpWindow = followUpWindow
         // Both are told not to touch the audio session: capture needs `.playAndRecord` and
         // playback would set `.playback`, and whichever ran last would win — silencing the
         // microphone or routing the answer to the earpiece. This type owns the session for both.
@@ -176,9 +198,13 @@ public final class BigBroVoiceSession: ObservableObject {
             .sink { [weak self] in self?.threshold = $0 }
             .store(in: &cancellables)
 
-        // Barge-in has to come from the level detector, not from the utterance stream: an
-        // utterance is only emitted once the user stops talking, which is far too late to
-        // interrupt with. This fires on the leading edge instead.
+        // Always-on barge-in has to come from the level detector, not from the utterance
+        // stream: an utterance is only emitted once the user stops talking, which is far too
+        // late to interrupt with. This fires on the leading edge instead.
+        //
+        // Wake-word mode cannot use it and doesn't subscribe to the effect — deciding whether
+        // speech was addressed here means reading it, and there is nothing to read until the
+        // utterance closes. That path interrupts from `consider` instead.
         microphone.$isSpeaking
             .receive(on: DispatchQueue.main)
             .filter { $0 }
@@ -232,9 +258,9 @@ public final class BigBroVoiceSession: ObservableObject {
     public func stop() {
         loopTask?.cancel()
         loopTask = nil
-        turnTask?.cancel()
-        turnTask = nil
-        closeFollowUp()
+        answerTask?.cancel()
+        answerTask = nil
+        clearSummon()
         microphone.stop()
         player.stop()
         releaseAudio()
@@ -250,7 +276,10 @@ public final class BigBroVoiceSession: ObservableObject {
     /// screen, and the loop returns to listening as it would have anyway.
     public func stopSpeaking() {
         player.stop()
-        if phase == .speaking { phase = .listening }
+        // Still generating, just no longer aloud. Resting here would advertise a turn that
+        // has not finished; `.armed` in particular would invite a request the loop is about
+        // to talk over.
+        if phase == .speaking { phase = answerTask != nil ? .thinking : restingPhase }
     }
 
     /// Where the loop sits between turns: waiting for its name, or for anything at all.
@@ -305,16 +334,8 @@ public final class BigBroVoiceSession: ObservableObject {
         do {
             for try await utterance in microphone.utterances() {
                 if Task.isCancelled { return }
-                if phase == .speaking || phase == .thinking {
-                    // Arrived mid-answer. With barge-in on, `userStartedSpeaking` has already
-                    // cut the previous turn short and this is the replacement; with it off,
-                    // the user talked over the answer and asked for nothing.
-                    guard allowsBargeIn else { continue }
-                }
-                await runTurn(utterance)
+                await consider(utterance)
                 if Task.isCancelled { return }
-                // The resting phase is left to the turn: only it knows whether the utterance
-                // was answered, ignored, or opened a follow-up window.
             }
         } catch {
             self.error = error.localizedDescription
@@ -322,27 +343,38 @@ public final class BigBroVoiceSession: ObservableObject {
         if !Task.isCancelled { phase = .idle }
     }
 
-    private func runTurn(_ audio: Data) async {
-        let turn = Task { [weak self] in
-            guard let self else { return }
-            await self.performTurn(audio)
+    /// Decides what one utterance is: a request, an interruption, or somebody else talking.
+    private func consider(_ audio: Data) async {
+        guard answerTask != nil else {
+            await takeTurn(audio)
+            return
         }
-        turnTask = turn
-        await turn.value
-        turnTask = nil
+
+        // Arrived while an answer was playing.
+        guard allowsBargeIn else { return }
+
+        if let wakeWord, !wakeWord.isEmpty {
+            // Only its own name stops it. Read this without touching the answer — the phase
+            // stays `.speaking`, the audio keeps playing — and let it run on unless the
+            // session was actually addressed.
+            guard let address = await interruption(audio, wakeWord: wakeWord) else { return }
+            await cancelAnswer(bargedIn: true)
+            act(on: address)
+            return
+        }
+
+        // No wake word: any speech interrupts, and `userStartedSpeaking` cut this one off on
+        // the leading edge already. All that is left is to let it unwind before replacing it.
+        await cancelAnswer(bargedIn: true)
+        await takeTurn(audio)
     }
 
-    /// Transcribes one utterance, decides whether it was meant for us, and answers it if so.
+    /// Transcribes one utterance and acts on it. The session is not answering anything.
     ///
     /// Transcription is a separate step rather than `converse(audio:)` doing it inline,
     /// because a wake word can only be checked against text: the gate has to run between
     /// hearing and generating, and folding both into one call leaves nowhere to put it.
-    private func performTurn(_ audio: Data) async {
-        // Read before the first await. The window can expire during transcription, and an
-        // utterance that began inside it was addressed to us whatever the timer does next.
-        let followingUp = followUpOpen
-        closeFollowUp()
-
+    private func takeTurn(_ audio: Data) async {
         error = nil
         didBargeIn = false
         phase = .transcribing
@@ -353,19 +385,40 @@ public final class BigBroVoiceSession: ObservableObject {
                 .trimmingCharacters(in: .whitespacesAndNewlines)
         } catch {
             self.error = error.localizedDescription
-            settle(followingUp: followingUp)
+            rest()
             return
         }
         guard !Task.isCancelled else { return }
 
         // A cough, a door, a passing car. Transcribing to nothing is the common case in a
-        // room, not an error.
+        // room, not an error — and it does not spend a summons, since the request it was
+        // waiting for has still not been spoken.
         guard !heard.isEmpty else {
-            settle(followingUp: followingUp)
+            rest()
             return
         }
 
-        switch address(heard, followingUp: followingUp) {
+        act(on: address(heard))
+    }
+
+    /// Transcribes an utterance heard over an answer, returning how it addressed the session,
+    /// or nil if it didn't.
+    ///
+    /// Failures are silent here. The answer is still playing and still correct; reporting a
+    /// transcription error over the top of it would put the session's own reply and an error
+    /// on screen at once, for a request nobody established had been made.
+    private func interruption(_ audio: Data, wakeWord: WakeWord) async -> Address? {
+        guard let heard = try? await client.transcribe(audio, format: "wav")
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !heard.isEmpty,
+              !Task.isCancelled,
+              let match = wakeWord.match(heard)
+        else { return nil }
+        return match.request.isEmpty ? .summoned : .request(match.request)
+    }
+
+    private func act(on address: Address) {
+        switch address {
         case .notForUs:
             // Deliberately silent. Armed in an occupied room, most of what the session hears
             // is somebody else's conversation, and reporting each one would be the noise.
@@ -380,14 +433,41 @@ public final class BigBroVoiceSession: ObservableObject {
             // there posts "hey big bro" as a message and leaves an answer bubble waiting for
             // a reply that was never requested. Waking is reported by the phase, which is
             // where a caller looks for it.
-            openFollowUp()
+            summon()
 
         case .request(let request):
+            clearSummon()
             transcript = request
             reply = ""
-            await answer(request)
-            openFollowUp()
+            startAnswer(request)
         }
+    }
+
+    /// Starts answering, without waiting for it.
+    ///
+    /// The loop has to stay on the utterance stream while this runs. An answer occupies the
+    /// session for seconds, and every way out of it — barge-in without a wake word, the phrase
+    /// with one — arrives as an utterance that has to be heard before it can be obeyed.
+    private func startAnswer(_ request: String) {
+        answerTask?.cancel()
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.answer(request)
+            guard !Task.isCancelled else { return }
+            self.answerTask = nil
+            self.rest()
+        }
+        answerTask = task
+    }
+
+    /// Stops the answer in flight and waits for it to unwind, so the next turn starts clean.
+    private func cancelAnswer(bargedIn: Bool) async {
+        guard let task = answerTask else { return }
+        if bargedIn { didBargeIn = true }
+        player.stop()
+        task.cancel()
+        await task.value
+        answerTask = nil
     }
 
     /// Generates and speaks an answer to one request.
@@ -452,67 +532,67 @@ public final class BigBroVoiceSession: ObservableObject {
         case notForUs
     }
 
-    private func address(_ heard: String, followingUp: Bool) -> Address {
+    private func address(_ heard: String) -> Address {
         guard let wakeWord, !wakeWord.isEmpty else { return .request(heard) }
         if let match = wakeWord.match(heard) {
             return match.request.isEmpty ? .summoned : .request(match.request)
         }
-        // No name in it. Inside the follow-up window that is fine — the conversation is
-        // already open and saying the name again would be strange. Outside it, not ours.
-        return followingUp ? .request(heard) : .notForUs
+        // No name in it. That is fine only if the session was just called by name and asked
+        // nothing — this is the request that was promised, and repeating the phrase to
+        // deliver it would be absurd. Any other time, somebody else is talking.
+        return summoned ? .request(heard) : .notForUs
     }
 
-    // MARK: - Follow-up window
+    // MARK: - Summons
 
-    /// Takes requests without the wake phrase for a while, then re-arms.
-    private func openFollowUp() {
-        rearmTask?.cancel()
-        rearmTask = nil
-
-        guard wakeWord != nil else {
-            // No gate at all: the session is always taking requests.
-            followUpOpen = false
-            phase = .listening
-            return
-        }
-        guard followUpWindow > 0 else {
-            followUpOpen = false
-            phase = .armed
-            return
-        }
-
-        followUpOpen = true
+    /// Takes the next utterance as a request without the phrase, briefly.
+    private func summon() {
+        summoned = true
         phase = .listening
-        let window = followUpWindow
+        rearmTask?.cancel()
         rearmTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(window))
+            try? await Task.sleep(for: .seconds(Self.summonWindow))
             guard !Task.isCancelled, let self else { return }
-            self.followUpOpen = false
+            self.summoned = false
             // Only if nothing has moved on since. A turn that started inside the window owns
             // the phase, and stamping `.armed` over `.thinking` would misreport it.
             if self.phase == .listening { self.phase = .armed }
         }
     }
 
-    private func closeFollowUp() {
+    private func clearSummon() {
         rearmTask?.cancel()
         rearmTask = nil
-        followUpOpen = false
+        summoned = false
     }
 
-    /// Returns to rest after an utterance that produced no turn, keeping an open window open.
-    private func settle(followingUp: Bool) {
-        if followingUp { openFollowUp() } else { phase = restingPhase }
+    /// Returns to rest between turns.
+    ///
+    /// With a wake word that is `.armed` — including straight after an answer, which is the
+    /// whole point of the phrase: the session stops speaking and immediately stops listening
+    /// for anything but its name. The one exception is an outstanding summons, which survives
+    /// an utterance that turned out to be nothing, because the request it is waiting for has
+    /// still not been spoken.
+    private func rest() {
+        phase = summoned ? .listening : restingPhase
     }
 
     // MARK: - Barge-in
 
+    /// Leading-edge interruption, for sessions with no wake word.
+    ///
+    /// Wake-word sessions deliberately do nothing here. This fires on energy alone, and energy
+    /// cannot tell the phrase from the conversation happening next to the phone — acting on it
+    /// would mean any voice in the room could cut the answer off, which is the arrangement a
+    /// wake word is chosen to avoid. Those sessions interrupt from ``consider(_:)`` instead,
+    /// once there is a transcript to check.
     private func userStartedSpeaking() {
-        guard allowsBargeIn, phase == .speaking || phase == .thinking else { return }
+        guard allowsBargeIn, wakeWord == nil || wakeWord?.isEmpty == true else { return }
+        guard phase == .speaking || phase == .thinking else { return }
         print("[BigBroVoiceSession] barge-in")
         didBargeIn = true
         player.stop()
-        turnTask?.cancel()
+        answerTask?.cancel()
     }
 
     // MARK: - Audio session
