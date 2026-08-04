@@ -145,9 +145,25 @@ public final class BigBroVoiceSession: ObservableObject {
     private var answerTask: Task<Void, Never>?
     private var rearmTask: Task<Void, Never>?
     private var routeObserver: NSObjectProtocol?
-    /// True between being called by name and the request that follows.
-    private var summoned = false
+    /// When an outstanding summons stops being honoured, or nil if there isn't one.
+    private var summonedUntil: ContinuousClock.Instant?
+    /// True once speech has begun inside the window, holding it open until that speech is
+    /// dealt with. See ``summoned``.
+    private var summonHeld = false
     private var cancellables: Set<AnyCancellable> = []
+
+    /// Whether the next utterance may be taken as a request without the wake phrase.
+    ///
+    /// Deliberately measured against when speech *started*, not when its transcript came back.
+    /// A request lands several seconds after the summons that invited it — the endpointer
+    /// waits out `hangoverDuration` before closing the utterance and the Mac then has to
+    /// transcribe it — so a deadline checked on arrival expires under exactly the request it
+    /// was opened for, and does it more the longer the sentence.
+    private var summoned: Bool {
+        if summonHeld { return true }
+        guard let summonedUntil else { return false }
+        return .now < summonedUntil
+    }
 
     public init(
         client: BigBroClient,
@@ -198,13 +214,11 @@ public final class BigBroVoiceSession: ObservableObject {
             .sink { [weak self] in self?.threshold = $0 }
             .store(in: &cancellables)
 
-        // Always-on barge-in has to come from the level detector, not from the utterance
-        // stream: an utterance is only emitted once the user stops talking, which is far too
-        // late to interrupt with. This fires on the leading edge instead.
-        //
-        // Wake-word mode cannot use it and doesn't subscribe to the effect — deciding whether
-        // speech was addressed here means reading it, and there is nothing to read until the
-        // utterance closes. That path interrupts from `consider` instead.
+        // The leading edge of speech. An utterance is only emitted once the user stops
+        // talking, which is too late for either thing that needs to know somebody has
+        // started: barge-in, which has to land while there is still an answer to cut off,
+        // and an open summons, which is about when the user began speaking rather than when
+        // their sentence finally reached the Mac.
         microphone.$isSpeaking
             .receive(on: DispatchQueue.main)
             .filter { $0 }
@@ -547,23 +561,38 @@ public final class BigBroVoiceSession: ObservableObject {
 
     /// Takes the next utterance as a request without the phrase, briefly.
     private func summon() {
-        summoned = true
+        summonHeld = false
+        summonedUntil = .now.advanced(by: .seconds(Self.summonWindow))
         phase = .listening
+
+        // Drives the phase only — ``summoned`` is answered by the deadline itself, so this
+        // firing late, or being cancelled, cannot leave the microphone open a moment longer
+        // than the window says.
         rearmTask?.cancel()
         rearmTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(Self.summonWindow))
-            guard !Task.isCancelled, let self else { return }
-            self.summoned = false
+            guard !Task.isCancelled, let self, !self.summonHeld else { return }
             // Only if nothing has moved on since. A turn that started inside the window owns
             // the phase, and stamping `.armed` over `.thinking` would misreport it.
             if self.phase == .listening { self.phase = .armed }
         }
     }
 
+    /// Holds an open summons until the speech now under way has been dealt with.
+    ///
+    /// The window governs when the user has to *start* answering, which is the only part of
+    /// it they can judge. How long they then talk for, and how long the Mac takes to
+    /// transcribe it, are not theirs to control and must not decide whether they were heard.
+    private func holdSummon() {
+        guard summonedUntil != nil, summoned else { return }
+        summonHeld = true
+    }
+
     private func clearSummon() {
         rearmTask?.cancel()
         rearmTask = nil
-        summoned = false
+        summonedUntil = nil
+        summonHeld = false
     }
 
     /// Returns to rest between turns.
@@ -574,19 +603,25 @@ public final class BigBroVoiceSession: ObservableObject {
     /// an utterance that turned out to be nothing, because the request it is waiting for has
     /// still not been spoken.
     private func rest() {
+        // The hold, though, is spent: it belonged to the utterance just dealt with. Dropping
+        // it puts the original deadline back in charge, so a cough two seconds into the
+        // window cannot extend it, and a cough after the window has passed ends it.
+        summonHeld = false
         phase = summoned ? .listening : restingPhase
     }
 
     // MARK: - Barge-in
 
-    /// Leading-edge interruption, for sessions with no wake word.
+    /// Somebody has started talking. Stops the clock on a summons, and cuts off an answer if
+    /// this session is the kind that lets it.
     ///
-    /// Wake-word sessions deliberately do nothing here. This fires on energy alone, and energy
-    /// cannot tell the phrase from the conversation happening next to the phone — acting on it
-    /// would mean any voice in the room could cut the answer off, which is the arrangement a
-    /// wake word is chosen to avoid. Those sessions interrupt from ``consider(_:)`` instead,
-    /// once there is a transcript to check.
+    /// Interruption from here is for sessions with no wake word only. This fires on energy
+    /// alone, and energy cannot tell the phrase from the conversation happening next to the
+    /// phone — acting on it would mean any voice in the room could cut the answer off, which
+    /// is the arrangement a wake word is chosen to avoid. Those sessions interrupt from
+    /// ``consider(_:)`` instead, once there is a transcript to check.
     private func userStartedSpeaking() {
+        holdSummon()
         guard allowsBargeIn, wakeWord == nil || wakeWord?.isEmpty == true else { return }
         guard phase == .speaking || phase == .thinking else { return }
         print("[BigBroVoiceSession] barge-in")
