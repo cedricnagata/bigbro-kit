@@ -1,6 +1,6 @@
 # BigBroKit
 
-An iOS Swift Package for connecting to a [BigBro](https://github.com/nagata-inc/bigbro) Mac and running inference over the local network. BigBroKit discovers the Mac via Bonjour, establishes a persistent TCP connection, and proxies requests to the Mac's local backend.
+An iOS Swift Package for connecting to a [BigBro](https://github.com/cedricnagata/bigbro) Mac and running inference over the local network. BigBroKit discovers the Mac via Bonjour, establishes a persistent TCP connection, and streams requests to the models the Mac is running.
 
 The Mac runs models in-process on Apple silicon through MLX — language and vision models via mlx-lm and mlx-vlm, Kokoro and Parakeet via mlx-audio — so this package covers chat with full tool calling, single-turn generation, text-to-speech and transcription. There is no Ollama and no separate inference server.
 
@@ -8,7 +8,7 @@ The Mac runs models in-process on Apple silicon through MLX — language and vis
 
 - iOS 17.0+
 - Xcode 15+
-- A Mac running the BigBro app on the same local network
+- A Mac on the same local network running the [BigBro](https://github.com/cedricnagata/bigbro) daemon (`bigbro serve`)
 
 ## Installation
 
@@ -20,9 +20,12 @@ The Mac runs models in-process on Apple silicon through MLX — language and vis
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/nagata-inc/bigbro-kit", from: "1.0.0")
+    .package(url: "https://github.com/cedricnagata/bigbro-kit", branch: "main")
 ]
 ```
+
+The package is not tagged yet, so pin the branch rather than a version. `from: "1.0.0"` has
+nothing to resolve against and fails at resolution time.
 
 ## Setup
 
@@ -65,7 +68,14 @@ for try await delta in client.chat([.user("Explain Swift concurrency in one para
 
 ## Connection lifecycle
 
-`BigBroClient` keeps **no persistent state** — every launch starts disconnected. The Mac remembers every device it has approved, so re-pairing after a fresh app launch is instant and silent (no dialog, no delay).
+Every launch starts disconnected. The Mac holds all **pairing** state — it remembers every device it
+has approved, so re-pairing after a fresh app launch is instant and silent (no dialog, no delay).
+
+BigBroKit persists only the names of Macs it has paired with, plus one flag for whether
+auto-reconnect is on, in `UserDefaults` under the `com.bigbro.kit` suite. That is a *convenience*
+record, not an authority: it tells the client which Bonjour service names are worth reconnecting to,
+and the Mac still decides whether the connection is approved. Clearing it (`forgetAllDevices()`)
+never revokes anything on the Mac — use `bigbro pair remove` there for that.
 
 ```
 .disconnected → pair() → .connected → (network degrades) → .reconnecting → (recovers) → .connected
@@ -125,8 +135,16 @@ Speech models are not named here. They are not selectable by id; the Mac manages
 @Published var connectedDevice: BigBroDevice?
 @Published var connectionState: ConnectionState   // .disconnected | .reconnecting | .connected
 @Published var missingModels: [String]            // required models not yet downloaded on the Mac
+@Published var modelDownloads: [String: ModelDownloadProgress]  // live progress, keyed by model id
+@Published var modelNotes: [String]               // what the Mac dropped from the last request
+@Published var pairedDeviceNames: Set<String>     // Macs this client remembers, by service name
+@Published var autoReconnectEnabled: Bool
 var isConnected: Bool                             // true only when fully .connected
 ```
+
+`modelNotes` carries the Mac's `modelCapabilities` message — one human-readable line per thing it
+adapted, e.g. tools stripped for a model whose template has no tools slot. It is replaced per
+request, and empty when the model could do everything asked.
 
 #### Initializer
 
@@ -151,6 +169,37 @@ func pair(with device: BigBroDevice) async throws -> Bool
 // Sends bye and tears down the connection.
 func disconnect()
 ```
+
+#### Reconnecting without asking
+
+`pair(with:)` is a deliberate act. Auto-reconnect is the standing version of it: the client keeps a
+long-lived Bonjour browse running and pairs with a remembered Mac the moment it appears.
+
+```swift
+func enableAutoReconnect()          // start browsing; reconnect to remembered Macs on sight
+func disableAutoReconnect()         // stop browsing and stay disconnected
+func resumeAutoReconnectIfEnabled() // call on launch to restore the user's last choice
+func forgetDevice(_ name: String)   // stop reconnecting to one Mac, by Bonjour service name
+func forgetAllDevices()             // forget all of them
+```
+
+The flag survives launches; the browse does not. An app that offers this as a setting should call
+`resumeAutoReconnectIfEnabled()` once at startup — without it the switch reads as on while nothing
+is actually browsing.
+
+`disconnect()` **suspends** auto-reconnect rather than fighting it. A manual disconnect that left
+the browse running would be undone within seconds by the next Bonjour advertisement — the button
+would look broken while the Mac is still advertising. So the loop parks, and the flag stays on.
+Either `pair(with:)` or `enableAutoReconnect()` lifts the suspension and reconnects, the latter
+even when the flag was already set.
+
+Only one pairing attempt runs at a time. Bonjour can report the same Mac more than once, and a
+second attempt landing mid-handshake opened a second connection that immediately superseded the
+first — which the Mac saw as a device connecting twice.
+
+Macs are remembered by **Bonjour service name**, which is the Mac's localized hostname — that is the
+only stable identifier available at discovery time, before a connection exists. Renaming a Mac
+therefore makes it a new device to this client, and it will need pairing again.
 
 #### Inference — chat
 
@@ -737,15 +786,29 @@ for try await chunk in client.chat(messages, streaming: false) {
 ```
 bigbro-kit/
 ├── Sources/
-│   ├── BigBroClient.swift      — main client (ObservableObject, agentic loop)
-│   ├── BigBroDevice.swift      — discovered device model
-│   ├── BonjourBrowser.swift    — Bonjour/mDNS discovery (NetServiceBrowser, MainActor)
-│   ├── Message.swift           — chat message model + wire serialization
-│   ├── GenerationOptions.swift — generation options + ResponseFormat enum
-│   ├── PeerConnection.swift    — TCP actor (4-byte framed JSON)
-│   └── Tool.swift              — BigBroTool definition + handler
+│   ├── BigBroClient.swift             — main client (ObservableObject, agentic loop)
+│   ├── BigBroDevice.swift             — discovered device model
+│   ├── BonjourBrowser.swift           — one-shot discovery for pair() (NetServiceBrowser)
+│   ├── ContinuousBonjourBrowser.swift — long-lived browse behind auto-reconnect
+│   ├── PairedDeviceStore.swift        — UserDefaults record of remembered Macs
+│   ├── PeerConnection.swift           — TCP actor (4-byte framed JSON)
+│   ├── Message.swift                  — chat message model + wire serialization
+│   ├── GenerationOptions.swift        — generation options + ResponseFormat enum
+│   ├── ModelDownloadProgress.swift    — the Mac's download progress messages
+│   ├── Tool.swift                     — BigBroTool definition + handler
+│   ├── VoiceCapture.swift             — BigBroMicrophone, energy-based endpointing
+│   ├── AudioPlayback.swift            — BigBroAudioPlayer, streams PCM as it arrives
+│   ├── AudioRoute.swift               — speaker vs. receiver for .playAndRecord
+│   ├── VoiceSession.swift             — BigBroVoiceSession, the hands-free loop
+│   └── WakeWord.swift                 — wake-phrase matching over the transcript
+├── Tests/
+│   └── WakeWordTests.swift
 └── Package.swift
 ```
+
+The two browsers are separate on purpose: `discover()` is a bounded scan a user waits on, while
+auto-reconnect needs a browse that runs for the life of the app. Folding them together made one
+flow's timeout the other's.
 
 ## Protocol overview
 
@@ -754,13 +817,19 @@ BigBroKit communicates with the Mac over TCP on port 8765. Each message is a 4-b
 | iOS → Mac | Fields | Purpose |
 |---|---|---|
 | `hello` | `deviceId`, `deviceName`, `appName`, `requiredModels?` | Initiate pairing |
-| `request` | `requestId`, `messages`, `streaming`, `tools?`, `model?`, `think?`, `reasoning_effort?`, … | Chat inference |
-| `generateRequest` | `requestId`, `prompt`, `streaming`, `images?`, `think?`, `reasoning_effort?`, … | Generate inference |
-| `speechRequest` | `requestId`, `input`, `voice?`, `model?`, `response_format?`, `speed?` | Text to speech |
-| `transcribeRequest` | `requestId`, `audio` (base64), `audioFormat?`, `model?`, `language?` | Speech to text |
-| `run` | `requestId`, `model?` (`"text"` / `"vision"` / `"speech"`, or a model id) | Start a model — put its weights in memory |
-| `stop` | `requestId`, `model?` (`"text"` / `"vision"`, or a model id) | Stop a model, keeping its download |
+| `request` | `requestId`, `messages`, `streaming`, `model`, `tools?`, `think?`, `reasoning_effort?`, … | Chat inference |
+| `generateRequest` | `requestId`, `prompt`, `streaming`, `model`, `images?`, `think?`, `reasoning_effort?`, … | Generate inference |
+| `speechRequest` | `requestId`, `input`, `voice?`, `speed?` | Text to speech |
+| `transcribeRequest` | `requestId`, `audio` (base64), `audioFormat?` | Speech to text. Max 10 MB decoded |
+| `run` | `requestId`, `model` (a catalog id, or `"tts"` / `"stt"` / `"speech"`) | Start a model — put its weights in memory |
+| `stop` | `requestId`, `model` (a catalog id) | Stop a model, keeping its download |
+| `ping` | — | Keepalive; answered with `pong` |
 | `bye` | — | Clean disconnect |
+
+`model` is **required** on every one of these. The Mac keeps no default, so a message that names no
+model comes back as an `error` rather than being answered by something else. The capability words
+`"text"` and `"vision"` are gone — they meant "whichever model is configured for this", and nothing
+is configured any more.
 
 | Mac → iOS | Fields | Purpose |
 |---|---|---|
@@ -768,13 +837,20 @@ BigBroKit communicates with the Mac over TCP on port 8765. Each message is a 4-b
 | `chunk` | `requestId`, `delta` | Streamed text token |
 | `thinking` | `requestId`, `delta` | Reasoning token, never mixed into `chunk` |
 | `toolCall` | `requestId`, `calls` | Tool calls array |
-| `audioStart` | `requestId`, `format`, `sampleRate`, `channels`, `model`, `voice` | Precedes audio so playback can be configured |
+| `audioStart` | `requestId`, `format`, `sampleRate`, `channels`, `voice` | Precedes audio so playback can be configured. Always `pcm`/24000/1 |
 | `audioChunk` | `requestId`, `audio` (base64), `seq` | Synthesized audio |
 | `transcript` | `requestId`, `text`, `language?` | Transcription result |
+| `modelCapabilities` | `requestId`, `model`, `supportsTools`, `supportsImages`, `supportsReasoning`, `supportsReasoningEffort`, `notes` | Precedes the answer when the model couldn't do everything asked; surfaces as `modelNotes` |
 | `done` | `requestId` | Request complete |
 | `error` | `requestId`, `message` | Inference error |
-
-Every response carries a `requestId` and the client routes on it, so chat, speech and
-transcription can be in flight simultaneously — which `converse()` relies on.
+| `modelDownloading` | `requestId`, `model`, `alreadyInProgress` | A request needed a model that isn't downloaded; the pull has started |
+| `modelDownloadProgress` | `model`, `status`, `completed`, `total` | Broadcast during a download; surfaces as `modelDownloads` |
+| `modelDownloadComplete` | `model`, `status`, `completed`, `total`, `success`, `error?` | Broadcast when one finishes |
 | `modelsUpdate` | `missingModels` | Live push when the Mac's downloaded models change |
+| `pong` | — | Keepalive response |
 | `bye` | — | Clean disconnect |
+
+Every *response* carries a `requestId` and the client routes on it, so chat, speech and
+transcription can be in flight simultaneously — which `converse()` relies on. The broadcasts
+(`modelDownloadProgress`, `modelDownloadComplete`, `modelsUpdate`) have none: they describe the
+Mac rather than any one request, and go to every paired device.
