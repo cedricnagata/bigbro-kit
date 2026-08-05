@@ -126,6 +126,10 @@ public final class BigBroClient: ObservableObject {
     /// sees the Mac still advertising. The setting itself stays on and persisted — this only
     /// holds it off until the user connects again (or the app is relaunched).
     private var autoReconnectSuspended = false
+    /// True from the moment a pair attempt starts until it settles. A manual pair holds this
+    /// too, which is what keeps the browse from opening a second socket to the same Mac while
+    /// the user's own tap is still in flight.
+    private var isPairing = false
     private let requests = RequestRegistry()
     private let requiredModels: [String]
     private let appName: String
@@ -159,12 +163,27 @@ public final class BigBroClient: ObservableObject {
 
     private func pairInternal(with device: BigBroDevice) async throws -> Bool {
         print("[BigBroClient] Pairing with \(device.name) at \(device.host):\(device.port)")
+        isPairing = true
+        defer { isPairing = false }
         let conn = PeerConnection()
-        try await conn.connect(host: device.host, port: UInt16(device.port))
-        print("[BigBroClient] TCP connected, sending hello")
-        let ack = try await conn.sendHello(deviceId: deviceId(), deviceName: UIDevice.current.name, appName: appName, requiredModels: requiredModels)
-        print("[BigBroClient] pair result: approved=\(ack.approved) missing=\(ack.missingModels)")
-        if ack.approved {
+        do {
+            try await conn.connect(host: device.host, port: UInt16(device.port))
+            print("[BigBroClient] TCP connected, sending hello")
+            let ack = try await conn.sendHello(deviceId: deviceId(), deviceName: UIDevice.current.name, appName: appName, requiredModels: requiredModels)
+            print("[BigBroClient] pair result: approved=\(ack.approved) missing=\(ack.missingModels)")
+            // A cancelled attempt — a manual pair overtaking an auto-pair, most often — must
+            // take its socket with it. Left open, it stays registered on the Mac under the
+            // same deviceId as the winning connection and evicts it when it finally closes.
+            guard !Task.isCancelled else {
+                print("[BigBroClient] Pair superseded; closing this connection")
+                await conn.disconnect()
+                return false
+            }
+            guard ack.approved else {
+                await conn.disconnect()
+                return false
+            }
+            retireCurrentConnection()
             peerConnection = conn
             connectedDevice = device
             connectionState = .connected
@@ -172,10 +191,25 @@ public final class BigBroClient: ObservableObject {
             startMessageLoop(conn: conn)
             rememberDevice(device)
             print("[BigBroClient] Paired")
-        } else {
+            return true
+        } catch {
             await conn.disconnect()
+            throw error
         }
-        return ack.approved
+    }
+
+    /// Drops the connection currently in place so a replacement can take over cleanly.
+    ///
+    /// The old message loop is cancelled and its socket closed; because `peerConnection` has
+    /// not yet been reassigned, the loop's identity check sees itself as current — so this
+    /// clears it first, leaving the caller to install the replacement.
+    private func retireCurrentConnection() {
+        guard let old = peerConnection else { return }
+        print("[BigBroClient] Retiring superseded connection")
+        messageTask?.cancel()
+        messageTask = nil
+        peerConnection = nil
+        Task { await old.disconnect() }
     }
 
     // MARK: - Auto-reconnect
@@ -902,8 +936,19 @@ public final class BigBroClient: ObservableObject {
             } catch {
                 print("[BigBroClient] Message loop error: \(error)")
             }
-            print("[BigBroClient] Message loop ended, tearing down")
-            await MainActor.run { [weak self] in self?.teardown() }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                // A loop that outlived its own connection must not tear down the one that
+                // replaced it. Without this check a superseded socket closing wipes a live
+                // session, which auto-reconnect then re-establishes — the two racing each
+                // other is what made the connection banner flicker.
+                guard self.peerConnection === conn else {
+                    print("[BigBroClient] Message loop ended for a superseded connection; ignoring")
+                    return
+                }
+                print("[BigBroClient] Message loop ended, tearing down")
+                self.teardown()
+            }
         }
     }
 
@@ -1068,7 +1113,7 @@ public final class BigBroClient: ObservableObject {
     private func handleDeviceAppeared(_ device: BigBroDevice) {
         guard autoReconnectEnabled, !autoReconnectSuspended else { return }
         guard peerConnection == nil else { return }
-        guard pendingPairTask == nil else { return }
+        guard pendingPairTask == nil, !isPairing else { return }
         guard pairedStore.contains(device.id) else {
             print("[BigBroClient] Auto-reconnect: ignoring unknown \(device.name)")
             return
