@@ -121,6 +121,11 @@ public final class BigBroClient: ObservableObject {
     private var messageTask: Task<Void, Never>?
     private var autoReconnectTask: Task<Void, Never>?
     private var pendingPairTask: Task<Void, Never>?
+    /// Set when the user disconnects on purpose. Auto-reconnect is for links that die on
+    /// their own; walking away deliberately must not be undone by a browse that immediately
+    /// sees the Mac still advertising. The setting itself stays on and persisted — this only
+    /// holds it off until the user connects again (or the app is relaunched).
+    private var autoReconnectSuspended = false
     private let requests = RequestRegistry()
     private let requiredModels: [String]
     private let appName: String
@@ -147,6 +152,8 @@ public final class BigBroClient: ObservableObject {
         // Manual pair wins over any in-flight auto-pair attempt.
         pendingPairTask?.cancel()
         pendingPairTask = nil
+        // Connecting by hand ends any suspension a previous manual disconnect imposed.
+        autoReconnectSuspended = false
         return try await pairInternal(with: device)
     }
 
@@ -177,7 +184,15 @@ public final class BigBroClient: ObservableObject {
     /// one appears. Safe to call repeatedly. Persists the enabled flag so the
     /// SDK resumes auto-reconnect on next launch.
     public func enableAutoReconnect() {
-        guard !autoReconnectEnabled else { return }
+        // Turning the switch on is an explicit ask to reconnect now, so it also lifts any
+        // suspension left by an earlier manual disconnect.
+        let wasSuspended = autoReconnectSuspended
+        autoReconnectSuspended = false
+        guard !autoReconnectEnabled else {
+            // Already on but parked by a manual disconnect: restart the browse now.
+            if wasSuspended && autoReconnectTask == nil { startAutoReconnectLoop() }
+            return
+        }
         autoReconnectEnabled = true
         pairedStore.autoReconnectEnabled = true
         print("[BigBroClient] enableAutoReconnect (paired count=\(pairedDeviceNames.count))")
@@ -852,10 +867,21 @@ public final class BigBroClient: ObservableObject {
         return out
     }
 
+    /// Disconnect from the paired Mac at the user's request.
+    ///
+    /// Auto-reconnect stays enabled but is held off until the next explicit `pair()` — it
+    /// exists to recover links that die on their own, and re-pairing here would make the
+    /// button look broken while the Mac is still advertising.
     public func disconnect() {
         print("[BigBroClient] disconnect called")
+        autoReconnectSuspended = true
         messageTask?.cancel()
         messageTask = nil
+        pendingPairTask?.cancel()
+        pendingPairTask = nil
+        autoReconnectTask?.cancel()
+        autoReconnectTask = nil
+        continuousBrowser.stop()
         let conn = peerConnection  // capture before teardown() clears it
         teardown()
         Task { await conn?.disconnect() }
@@ -1006,7 +1032,7 @@ public final class BigBroClient: ObservableObject {
         // Nothing further will arrive for in-flight requests; fail them rather than leaving
         // callers awaiting a stream that can never complete.
         requests.finishAll(throwing: BigBroError.notPaired)
-        if autoReconnectEnabled {
+        if autoReconnectEnabled && !autoReconnectSuspended {
             // Re-arm the browse so currently-visible Macs trigger a fresh
             // `.appeared` event and we attempt to reconnect immediately.
             print("[BigBroClient] teardown: re-arming auto-reconnect browse")
@@ -1040,7 +1066,7 @@ public final class BigBroClient: ObservableObject {
     }
 
     private func handleDeviceAppeared(_ device: BigBroDevice) {
-        guard autoReconnectEnabled else { return }
+        guard autoReconnectEnabled, !autoReconnectSuspended else { return }
         guard peerConnection == nil else { return }
         guard pendingPairTask == nil else { return }
         guard pairedStore.contains(device.id) else {
@@ -1080,7 +1106,7 @@ public final class BigBroClient: ObservableObject {
     }
 
     private func handleEnteredBackground() {
-        guard autoReconnectEnabled else { return }
+        guard autoReconnectEnabled, !autoReconnectSuspended else { return }
         print("[BigBroClient] App backgrounded — pausing auto-reconnect browse")
         autoReconnectTask?.cancel()
         autoReconnectTask = nil
@@ -1088,7 +1114,7 @@ public final class BigBroClient: ObservableObject {
     }
 
     private func handleEnteringForeground() {
-        guard autoReconnectEnabled, autoReconnectTask == nil else { return }
+        guard autoReconnectEnabled, !autoReconnectSuspended, autoReconnectTask == nil else { return }
         print("[BigBroClient] App foregrounding — resuming auto-reconnect browse")
         startAutoReconnectLoop()
     }
