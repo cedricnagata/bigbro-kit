@@ -754,7 +754,8 @@ public final class BigBroClient: ObservableObject {
         tools: [BigBroTool] = [],
         options: GenerationOptions? = nil,
         reasoningEffort: ReasoningEffort? = nil,
-        speaks: Bool = true
+        speaks: Bool = true,
+        maxToolRounds: Int = 8
     ) -> AsyncThrowingStream<ConverseEvent, Error> {
         AsyncThrowingStream { continuation in
             let work = Task {
@@ -773,7 +774,8 @@ public final class BigBroClient: ObservableObject {
                     for try await event in self.converse(messages, model: model, voice: voice,
                                                          tools: tools, options: options,
                                                          reasoningEffort: reasoningEffort,
-                                                         speaks: speaks) {
+                                                         speaks: speaks,
+                                                         maxToolRounds: maxToolRounds) {
                         if Task.isCancelled { break }
                         continuation.yield(event)
                     }
@@ -814,6 +816,7 @@ public final class BigBroClient: ObservableObject {
         reasoningEffort: ReasoningEffort? = nil,
         speaks: Bool = true,
         streaming: Bool = true,
+        maxToolRounds: Int = 8,
         onThinking: (@Sendable (String) -> Void)? = nil
     ) -> AsyncThrowingStream<ConverseEvent, Error> {
         AsyncThrowingStream { continuation in
@@ -845,6 +848,7 @@ public final class BigBroClient: ObservableObject {
                                                      streaming: streaming, tools: tools,
                                                      options: options, think: think,
                                                      reasoningEffort: reasoningEffort,
+                                                     maxToolRounds: maxToolRounds,
                                                      onThinking: onThinking) {
                         if Task.isCancelled { break }
                         continuation.yield(.text(delta))
