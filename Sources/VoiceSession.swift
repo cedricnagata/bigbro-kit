@@ -521,6 +521,18 @@ public final class BigBroVoiceSession: ObservableObject {
                     self.error = message
                 }
             }
+        } catch BigBroError.toolLoopLimit(let rounds) {
+            // A capped loop is not a failed turn. Every tool already ran, so whatever the
+            // model was doing to the caller's state it has already done; reporting a failure
+            // over the top of real work is the wrong end of the stick. Same reasoning as
+            // `.speechFailed` above — the part that worked stands.
+            //
+            // Reported only when the cap left nothing to show for it: with no text and no
+            // error, the turn ends in silence and the user is given no reason for it.
+            print("[BigBroVoiceSession] tool loop capped at \(rounds) rounds")
+            if spoken.isEmpty {
+                self.error = BigBroError.toolLoopLimit(rounds: rounds).localizedDescription
+            }
         } catch {
             self.error = error.localizedDescription
         }
