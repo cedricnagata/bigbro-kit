@@ -11,6 +11,9 @@ public enum BigBroError: Error, LocalizedError {
     /// The Mac doesn't have the requested model installed and is downloading
     /// it. Watch `BigBroClient.modelDownloads` for progress.
     case modelDownloading(model: String, alreadyInProgress: Bool)
+    /// The agentic loop hit `maxToolRounds` without the model producing a final answer.
+    /// Raise the limit on `chat()` if the task legitimately needs more rounds.
+    case toolLoopLimit(rounds: Int)
 
     public var errorDescription: String? {
         switch self {
@@ -21,6 +24,8 @@ public enum BigBroError: Error, LocalizedError {
             return alreadyInProgress
                 ? "Model '\(model)' is still downloading on the Mac."
                 : "Model '\(model)' is not downloaded — started downloading on the Mac."
+        case .toolLoopLimit(let rounds):
+            return "The model kept calling tools for \(rounds) rounds without answering."
         }
     }
 }
@@ -286,6 +291,10 @@ public final class BigBroClient: ObservableObject {
     ///     default (`.medium` for gpt-oss). See `ReasoningEffort`.
     ///   - keepAlive: Accepted for wire compatibility and ignored by the Mac, which keeps a
     ///     model loaded until it is explicitly stopped.
+    ///   - maxToolRounds: How many times the loop will run tools and go back to the model
+    ///     before giving up with `BigBroError.toolLoopLimit`. A model that answers its own
+    ///     tool results never reaches this; one that has talked itself into a cycle does, and
+    ///     without a cap it would keep the Mac generating and the tools firing indefinitely.
     ///   - onThinking: Called with each reasoning token as it streams in, ahead of the final
     ///     answer. Ignored unless `think` is `true`.
     public func chat(
@@ -298,6 +307,7 @@ public final class BigBroClient: ObservableObject {
         think: Bool? = nil,
         reasoningEffort: ReasoningEffort? = nil,
         keepAlive: String? = nil,
+        maxToolRounds: Int = 8,
         onThinking: (@Sendable (String) -> Void)? = nil
     ) -> AsyncThrowingStream<String, Error> {
         guard let conn = peerConnection else {
@@ -315,6 +325,7 @@ public final class BigBroClient: ObservableObject {
                     return try JSONSerialization.jsonObject(with: d)
                 }) ?? []
                 do {
+                    var round = 0
                     while true {
                         let requestId = UUID().uuidString
                         print("[BigBroClient] Request \(requestId.prefix(8)): sending to Mac")
@@ -337,7 +348,11 @@ public final class BigBroClient: ObservableObject {
                         try await conn.send(msg)
 
                         var accumulated = ""
-                        var pendingToolCalls: [[String: Any]]? = nil
+                        var accumulatedThinking = ""
+                        // Accumulated, not assigned: the Mac emits one `toolCall` message per
+                        // call, so a turn asking for three tools arrives as three events.
+                        // Overwriting here silently ran only the last one.
+                        var pendingToolCalls: [[String: Any]] = []
                         for try await event in eventStream {
                             // Abandoning the response mid-flight — barge-in, a closed screen —
                             // should stop the work, not just stop watching it. Checked here
@@ -345,12 +360,14 @@ public final class BigBroClient: ObservableObject {
                             if Task.isCancelled { break }
                             switch event {
                             case .delta(let text):
-                                if streaming { continuation.yield(text) } else { accumulated += text }
+                                accumulated += text
+                                if streaming { continuation.yield(text) }
                             case .thinking(let text):
+                                accumulatedThinking += text
                                 onThinking?(text)
                             case .toolCalls(let calls):
                                 print("[BigBroClient] Tool calls received: \(calls.count)")
-                                pendingToolCalls = calls
+                                pendingToolCalls.append(contentsOf: calls)
                             default:
                                 break  // audio and transcripts belong to other requests
                             }
@@ -359,13 +376,28 @@ public final class BigBroClient: ObservableObject {
                             print("[BigBroClient] Request \(requestId.prefix(8)): cancelled")
                             break
                         }
-                        guard let calls = pendingToolCalls else {
+                        if pendingToolCalls.isEmpty {
                             print("[BigBroClient] Request \(requestId.prefix(8)): done")
                             if !streaming { continuation.yield(accumulated) }
                             break
                         }
-                        print("[BigBroClient] Executing \(calls.count) tool call(s)")
-                        workingMessages.append(Message(role: .assistant, content: "", toolCalls: calls).toDict())
+                        let calls = pendingToolCalls
+                        round += 1
+                        if round > maxToolRounds {
+                            print("[BigBroClient] Tool loop hit \(maxToolRounds) rounds, giving up")
+                            continuation.finish(throwing: BigBroError.toolLoopLimit(rounds: maxToolRounds))
+                            return
+                        }
+                        print("[BigBroClient] Executing \(calls.count) tool call(s) (round \(round))")
+                        // The reasoning that produced these calls goes back with them. A harmony
+                        // model that loses its own analysis between rounds re-derives it — or
+                        // re-issues the same call — instead of building on it.
+                        workingMessages.append(Message(
+                            role: .assistant,
+                            content: accumulated,
+                            toolCalls: calls,
+                            thinking: accumulatedThinking.isEmpty ? nil : accumulatedThinking
+                        ).toDict())
                         for call in calls {
                             guard let fn = call["function"] as? [String: Any],
                                   let name = fn["name"] as? String else {
