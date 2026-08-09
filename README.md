@@ -464,7 +464,7 @@ Listen, transcribe, answer (with tools), speak, repeat — continuously, hands-f
 ```swift
 let session = BigBroVoiceSession(client: client, model: "gpt-oss-20b", tools: myTools)
 await session.start()
-// session.phase, .transcript, .reply, .level, .history are all @Published
+// session.phase, .turn, .transcript, .reply, .level, .history are all @Published
 session.stop()
 ```
 
@@ -476,6 +476,39 @@ that cancellation propagates, so the Mac stops generating rather than finishing 
 nobody will hear. The interrupted turn is still committed to history, partial answer included,
 so a follow-up like "sorry, go on" has something to refer to. With a wake word set, what counts
 as talking over it narrows to the phrase; see [`WakeWord`](#wakeword--answering-only-when-spoken-to).
+
+#### Mirroring turns into a conversation
+
+`turn` publishes one `Turn { id, question }` per answered turn. **Key your rows on `turn.id`**,
+and fill them from `reply`:
+
+```swift
+session.$turn
+    .receive(on: DispatchQueue.main)
+    .compactMap { $0 }
+    .removeDuplicates()
+    .sink { turn in
+        rows.append(Row(question: turn.question))
+        current = rows.count - 1
+    }
+
+session.$reply
+    .receive(on: DispatchQueue.main)
+    .sink { rows[current].answer = $0 }
+```
+
+Two things that look equivalent are not, and both fail in ways worth naming.
+
+Deduplicating on `transcript` drops a turn when the same question is asked twice. `transcript`
+is a display value — "what it heard" for a status line — and carries no notion of which turn it
+belongs to. `removeDuplicates()` is safe on `turn` for exactly that reason: two identical
+questions are two `Turn`s with two ids, so only a genuine re-emission compares equal.
+
+Waiting for `phase` to return to `.listening`/`.armed` before starting the next row fails
+**specifically at barge-in**, which is the case worth getting right. An interruption runs
+`.speaking` → `.transcribing` → `.thinking` with no resting phase in between, so a caller
+gating on one never opens a row for the interrupting question and writes its answer over the
+previous one, in the previous row. `phase` is for status; `turn` is for turns.
 
 The session sets `.playAndRecord` with mode `.videoChat` **and** calls
 `setVoiceProcessingEnabled(true)` on one engine shared by capture and playback. Both halves

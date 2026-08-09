@@ -13,7 +13,7 @@ import Combine
 /// ```swift
 /// let session = BigBroVoiceSession(client: client, tools: myTools)
 /// await session.start()
-/// // session.phase, .transcript, .reply drive the UI
+/// // session.phase drives the status; session.turn and .reply drive the conversation
 /// ```
 ///
 /// Everything is published, so a SwiftUI view can observe it directly.
@@ -43,8 +43,37 @@ public final class BigBroVoiceSession: ObservableObject {
         case speaking
     }
 
+    /// One spoken exchange, and an identity for it.
+    ///
+    /// The identity is the point. It is what makes a new turn distinguishable from the one
+    /// before it, which nothing else published here can do: the text cannot, because asking the
+    /// same thing twice is two turns, and the phase cannot, because an interruption goes
+    /// straight from one turn into the next without passing through a resting phase.
+    public struct Turn: Identifiable, Equatable, Sendable {
+        public let id: UUID
+        /// What the user asked, with any wake phrase stripped off the front.
+        public let question: String
+    }
+
     @Published public private(set) var phase: Phase = .idle
+    /// The exchange under way, published once at the moment the session takes an utterance as
+    /// a request for it. Nil until the first one, and again after ``resetConversation()``.
+    ///
+    /// This is what to mirror when spoken turns become rows in a conversation — a caller that
+    /// keys rows on ``Turn/id`` gets a fresh row per turn for free, including the turn that
+    /// interrupted the last one. Deriving that from ``phase`` instead does not work, and fails
+    /// specifically at barge-in: cutting an answer off runs `.speaking` → `.transcribing` →
+    /// `.thinking` with no resting phase in between, so a caller waiting for one to tell it the
+    /// turn ended writes the new answer over the old one, in the old row.
+    ///
+    /// `removeDuplicates()` is safe on this and is not on ``transcript``, for the same reason:
+    /// two identical questions are two values here, and only a genuine re-emission compares
+    /// equal.
+    @Published public private(set) var turn: Turn?
     /// The most recent thing the user was heard to say.
+    ///
+    /// A display value — "what it heard" for a status line. It says nothing about which turn it
+    /// belongs to, so it cannot start one; see ``turn``.
     @Published public private(set) var transcript = ""
     /// The current answer, accumulating as it generates.
     @Published public private(set) var reply = ""
@@ -312,6 +341,7 @@ public final class BigBroVoiceSession: ObservableObject {
     /// Forgets the conversation, keeping the system prompt. The session can keep running.
     public func resetConversation() {
         history = systemPrompt.map { [.system($0)] } ?? []
+        turn = nil
         transcript = ""
         reply = ""
     }
@@ -452,6 +482,9 @@ public final class BigBroVoiceSession: ObservableObject {
         case .request(let request):
             clearSummon()
             transcript = request
+            // Before `reply`, so a caller observing both on the main queue has the new turn in
+            // hand before the first delta of its answer arrives.
+            turn = Turn(id: UUID(), question: request)
             reply = ""
             startAnswer(request)
         }
